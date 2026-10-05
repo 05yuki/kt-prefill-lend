@@ -1,0 +1,644 @@
+# SPDX-License-Identifier: Apache-2.0
+"""KT prefill lend (KT_PREFILL_LEND=1): during a streamed prefill the
+GPU-resident weights hand their physical memory to the prefill and come back,
+at the same addresses, before decode.
+
+Model-agnostic; a tree wires it in at five points (see
+patches/sglang-kt-prefill-lend.py for SGLang):
+
+  bind_model(model)        right after the model is built, before any weight
+                           loads (model_loader._initialize_model)
+  after_load()             after every module's weight processing, before the
+                           KV pool is sized (load_weights_and_postprocess)
+  before_forward(batch)    at the model runner's forward entry, outside any graph
+  scratch_empty(...)       for buffers only a streamed prefill uses (the
+                           streamer's slots and inputs, the prefill workspace)
+  scratch_region()         the same for allocations made lazily inside a
+                           streamed prefill (contents are not kept from one
+                           prefill window to the next)
+  phase()                  "load" / "decode" / "prefill", for code that picks
+                           a buffer by phase
+
+What is lent: the first model bound (a draft built later stays resident),
+its decoder layers (the largest ModuleList named "layers")
+and, per layer, every CUDA parameter of at least KT_PREFILL_LEND_MIN_BYTES
+(default 1 MiB) whose name contains none of KT_PREFILL_LEND_SKIP
+(comma-separated, default "engram": V4.1's engram is read ahead of its layer
+on another stream). Each layer gets one span, its own allocation in
+torch_memory_saver tag "kt_lend_weights", made layer by layer at the bind so
+the originals are dropped as it goes; the span has room for the layer's
+small parameters too, which the loading may stack into a fused owner.
+
+Fused owners: after loading, a model may have stacked several parameters into
+one tensor attribute and turned the parameters into views of it (Flash-Next's
+gated delta net: _fused_in_proj_weight = [in_proj_qkvz; in_proj_ba]). Such a
+tensor (a plain CUDA tensor attribute of a module in the layer, holding at
+least one lent parameter) is taken whole into the span; every parameter of
+the layer that points into it becomes a view of it there, and it is pointed
+at the slot too while lent. Tensors the model derives as copies (no
+parameter inside) are left alone: they stay resident.
+
+After load, every layer is laid out again from what the loading left:
+fused owners first, then the lent parameters as they are now (a repack may
+have changed their shape, or made new ones of at least the minimum size),
+through pinned host memory back into the same span when it fits.
+
+Phase swap: to prefill = pause the weights tag (physical memory released,
+addresses kept), resume the scratch tag; to decode = empty_cache, pause
+scratch, resume weights, copy the pinned mirror back. While paused, the
+weights' addresses map nothing: a read that misses the per-layer entry
+faults at once. Entering layer i (a forward pre-hook on the layer and on
+each child holding lent parameters, and every forward* method of the layer,
+for models that call the layer by another method, like V4's
+forward_hc_pre_from_prev) points the previous layer back at its span, points
+layer i's lent tensors at slot i % 2 (prefetched on a side stream while
+layer i-1 ran) and starts layer i+1's copy.
+
+Chunk hint (KT_PREFILL_LEND_HINT=<prefix>): each prefill window measures the
+free memory at its start, torch's peak reserved growth and the largest
+forward; the rank writes <prefix>-rank<r>.json with the chunk that would
+still have fitted (margin KT_PREFILL_LEND_MARGIN_MB, 512), the smallest since
+the server started.
+
+Requires torch_memory_saver (hook mode "torch").
+"""
+
+import contextlib
+import os
+import time
+
+import torch
+
+ENABLED = os.environ.get("KT_PREFILL_LEND", "0") == "1"
+MIN_BYTES = int(os.environ.get("KT_PREFILL_LEND_MIN_BYTES", str(1 << 20)))
+TAG_WEIGHTS = "kt_lend_weights"
+TAG_SCRATCH = "kt_lend_scratch"
+HINT = os.environ.get("KT_PREFILL_LEND_HINT", "")
+MARGIN = int(os.environ.get("KT_PREFILL_LEND_MARGIN_MB", "512")) << 20
+DEBUG = os.environ.get("KT_PREFILL_LEND_DEBUG", "0") == "1"
+SKIP = [w for w in os.environ.get("KT_PREFILL_LEND_SKIP", "engram").split(",") if w]
+# KT_PREFILL_LEND_IDLE: lent but not brought back layer by layer during a
+# prefill, for weights the prefill path never reads (GLM-5.3's hot experts:
+# its full-GPU prefill writes every expert into its own slot). Laid out at the
+# end of the span; only the part before them is copied into the slot, and they
+# keep pointing at the paused span, so a read faults instead of going wrong.
+IDLE = [w for w in os.environ.get("KT_PREFILL_LEND_IDLE", "").split(",") if w]
+
+STATE = {"phase": "load", "scratch_bytes": 0, "scratch_chunk_bytes": 0, "to_prefill": 0, "to_decode": 0}
+_saver = None
+
+
+def _log(msg: str) -> None:
+    print(f"[kt-lend] {msg}", flush=True)
+
+
+def _tms():
+    global _saver
+    if _saver is None:
+        import torch_memory_saver as m
+
+        _saver = m.torch_memory_saver
+        _saver.hook_mode = "torch"
+    return _saver
+
+
+def _align(n: int) -> int:
+    return (n + 255) & ~255
+
+
+def _nbytes(t) -> int:
+    return t.numel() * t.element_size()
+
+
+def phase() -> str:
+    return STATE["phase"]
+
+
+# -- scratch ---------------------------------------------------------------------
+
+def scratch_empty(shape, dtype, device, per_chunk: bool = False) -> torch.Tensor:
+    """A tensor resident only during a streamed prefill (a plain one when
+    lending is off). Call before the weights load. per_chunk: its size grows
+    with the prefill chunk (counted for the chunk hint)."""
+    if not ENABLED:
+        return torch.empty(shape, dtype=dtype, device=device)
+    with _tms().region(tag=TAG_SCRATCH):
+        t = torch.empty(shape, dtype=dtype, device=device)
+    STATE["scratch_bytes"] += _nbytes(t)
+    if per_chunk:
+        STATE["scratch_chunk_bytes"] += _nbytes(t)
+    return t
+
+
+def scratch_region():
+    """Allocations inside go to the scratch tag while lending is on. Meant for
+    buffers a streamed prefill makes on its first use (the tag is resident
+    then); outside a prefill they are made as plain allocations."""
+    if not ENABLED or STATE["phase"] == "decode":
+        return contextlib.nullcontext()
+    return _tms().region(tag=TAG_SCRATCH)
+
+
+# -- layout ----------------------------------------------------------------------
+# A layer's layout is a list of items, each placed at a byte offset of its span:
+#   ("param", name, shape, dtype, off, nbytes)
+#   ("owner", module, attr, shape, dtype, off, nbytes, [(name, shape, dtype, delta, nbytes), ...])
+# where an owner's inner parameters are views at off + delta.
+
+def _decoder_layers(model):
+    best, best_bytes = None, 0
+    for name, m in model.named_modules():
+        if not isinstance(m, torch.nn.ModuleList) or not (name == "layers" or name.endswith(".layers")):
+            continue
+        nb = sum(_nbytes(p) for p in m.parameters() if p.device.type == "cuda")
+        if nb > best_bytes:
+            best, best_bytes = m, nb
+    if best is None:
+        return []
+    return [l for l in best if isinstance(l, torch.nn.Module) and type(l).__name__ != "PPMissingLayer"]
+
+
+def _place(dspan, item):
+    if item[0] == "param":
+        _, name, shape, dtype, off, nb = item
+        return dspan[off:off + nb].view(dtype).view(shape)
+    _, mod, attr, shape, dtype, off, nb, inner = item
+    return dspan[off:off + nb].view(dtype).view(shape)
+
+
+def _point(layer, dspan, layout, limit=None) -> None:
+    """Point the layer's lent tensors at dspan (its device span or a slot);
+    with a limit, only those placed before it."""
+    for item in layout:
+        if limit is not None and (item[4] if item[0] == "param" else item[5]) >= limit:
+            continue
+        if item[0] == "param":
+            layer.get_parameter(item[1]).data = _place(dspan, item)
+        else:
+            _, mod, attr, shape, dtype, off, nb, inner = item
+            setattr(mod, attr, _place(dspan, item))
+            for name, pshape, pdtype, delta, pnb in inner:
+                layer.get_parameter(name).data = dspan[off + delta:off + delta + pnb].view(pdtype).view(pshape)
+
+
+def bind_model(model) -> None:
+    """Right after the model is built: each decoder layer's large CUDA
+    parameters move into one span of their own, layer by layer."""
+    if not ENABLED or "layers" in STATE or STATE["phase"] != "load":
+        return
+    layers = _decoder_layers(model)
+    entries = []
+    for layer in layers:
+        lay, off, slack = [], 0, 0
+        for name, p in layer.named_parameters():
+            if p.device.type != "cuda" or not p.is_contiguous() or any(w in name for w in SKIP):
+                continue
+            if _nbytes(p) < MIN_BYTES:
+                # room for it in case the loading stacks it into a fused
+                # owner with lent parameters (Flash-Next's in_proj_ba)
+                slack += _align(_nbytes(p))
+                continue
+            lay.append(("param", name, tuple(p.shape), p.dtype, off, _nbytes(p)))
+            off = _align(off + _nbytes(p))
+        if lay:
+            entries.append((layer, lay, _align(off) + slack))
+    if not entries:
+        _log("no decoder layer with lendable weights: off")
+        return
+    device = entries[0][0].get_parameter(entries[0][1][0][1]).device
+    dev_spans = []
+    for idx, (layer, lay, span) in enumerate(entries):
+        with _tms().region(tag=TAG_WEIGHTS):
+            dspan = torch.empty(span, dtype=torch.uint8, device=device)
+        for item in lay:
+            _place(dspan, item).copy_(layer.get_parameter(item[1]))
+        _point(layer, dspan, lay)
+        dev_spans.append(dspan)
+        # the dropped originals go back to torch's cache, not to the driver,
+        # and torch_memory_saver allocates from the driver: hand them back
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        _hook_entries(layer, idx, {item[1] for item in lay})
+    STATE.update(layers=[e[0] for e in entries], layouts=[e[1] for e in entries],
+                 spans=[e[2] for e in entries], dev_spans=dev_spans, dev_full=list(dev_spans),
+                 device=device, counts=dict(owners=0, grown=0, moved=0, dropped=0, aliases=0, early=0))
+    for idx, (layer, _, _) in enumerate(entries):
+        for m in layer.modules():
+            m._kt_lend_layer = idx
+    # the one-layer slots now, while the card is empty (the spans' room
+    # covers what moving the owners in adds)
+    STATE["slots"] = [scratch_empty((max(STATE["spans"]),), torch.uint8, device) for _ in range(2)]
+    _log(f"{len(entries)} decoder layers, {sum(STATE['spans']) / 1e9:.3f} GB of weights in per-layer "
+         f"spans on {device} (min parameter {MIN_BYTES / 1e6:.1f} MB)")
+
+
+def _hook_entries(layer, idx: int, lent) -> None:
+    """Every way into layer idx enters it: its own forward, the children
+    holding lent parameters, and its other forward* methods."""
+    layer._kt_lend_idx = idx
+    layer.register_forward_pre_hook(_enter_hook)
+    for cname, child in layer.named_children():
+        if any(n.startswith(cname + ".") for n in lent):
+            child._kt_lend_idx = idx
+            child.register_forward_pre_hook(_enter_hook)
+    for name in dir(type(layer)):
+        if name.startswith("forward") and name != "forward" and callable(getattr(type(layer), name)):
+            setattr(layer, name, _entering(getattr(layer, name), idx))
+
+
+def _entering(fn, idx: int):
+    def wrapper(*args, **kwargs):
+        _enter(idx)
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _lent_names(lay):
+    """The parameter names a layout lends, an owner's inner ones included."""
+    names = []
+    for item in lay:
+        if item[0] == "param":
+            names.append(item[1])
+        else:
+            names += [rec[0] for rec in item[7]]
+    return names
+
+
+def _owners_after_load(layer, lay):
+    """Plain CUDA tensor attributes in the layer that hold at least one lent
+    parameter: [(module, attr, tensor, [(name, delta)]...)]."""
+    params = dict(layer.named_parameters())
+    lent = set(_lent_names(lay))
+    found = []
+    for mod in layer.modules():
+        for attr, val in list(vars(mod).items()):
+            if attr.startswith("_parameters") or attr.startswith("_buffers"):
+                continue
+            if not torch.is_tensor(val) or isinstance(val, torch.nn.Parameter) or not val.is_cuda:
+                continue
+            if not val.is_contiguous() or _nbytes(val) < MIN_BYTES:
+                continue
+            lo, hi = val.data_ptr(), val.data_ptr() + _nbytes(val)
+            inner = [(n, p.data_ptr() - lo) for n, p in params.items()
+                     if p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()]
+            if any(n in lent for n, _ in inner):
+                found.append((mod, attr, val, inner))
+    return found
+
+
+def _relayout(i: int, counts) -> None:
+    """Lay layer i out again from what the loading left: fused owners
+    first, then the lent parameters as they are now, through pinned host
+    memory back into the same span when it fits."""
+    device = STATE["device"]
+    layer = STATE["layers"][i]
+    lay = STATE["layouts"][i]
+    full = STATE["dev_full"][i]
+    lo, hi = full.data_ptr(), full.data_ptr() + full.numel()
+    found = _owners_after_load(layer, lay)
+    inner_names = {n for _, _, _, inner in found for n, _ in inner}
+    new, off = [], 0
+    for mod, attr, val, inner in found:
+        recs = [(n, tuple(layer.get_parameter(n).shape), layer.get_parameter(n).dtype, d,
+                 _nbytes(layer.get_parameter(n))) for n, d in inner]
+        new.append(("owner", mod, attr, tuple(val.shape), val.dtype, off, _nbytes(val), recs))
+        off = _align(off + _nbytes(val))
+        counts["owners"] += 1
+    mod = val = inner = None  # the owners' originals go when the layer is pointed away
+    params = dict(layer.named_parameters())
+    # a layer laid out again during the load has owner items: their inner
+    # parameters are what it lends (taking item[1], the owner's module, as a
+    # name dropped the owner and overwrote it in place, 10-05)
+    names = _lent_names(lay)
+    # what the loading made anew (a repack under another name) and is big
+    # enough is lent too
+    names += [n for n, q in params.items() if n not in names and q.is_cuda and q.is_contiguous()
+              and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP)]
+    names = ([n for n in names if not any(w in n for w in IDLE)]
+             + [n for n in names if any(w in n for w in IDLE)])
+    active = None
+    for name in names:
+        q = params.get(name)
+        if active is None and any(w in name for w in IDLE):
+            active = off
+        if name in inner_names or q is None or not q.is_cuda or not q.is_contiguous():
+            if q is None:
+                # a second name for a parameter registered under another one
+                # (alias_or_bind_derived_param: Flash-Next's *_blockscale_swizzled
+                # is w*_weight_scale), which named_parameters() lists once
+                try:
+                    alias = any(layer.get_parameter(name) is v for v in params.values())
+                except AttributeError:
+                    alias = False
+                counts["aliases" if alias else "dropped"] += 1
+                if not alias:
+                    counts.setdefault("gone_names", set()).add(name)
+            continue
+        if not lo <= q.data_ptr() < hi:
+            counts["moved"] += 1
+        new.append(("param", name, tuple(q.shape), q.dtype, off, _nbytes(q)))
+        off = _align(off + _nbytes(q))
+    params = q = None
+    span = _align(off)
+    STATE.setdefault("active", {})[i] = span if active is None else active
+    # through pinned host memory, back into the same span (the bind left
+    # room for the small parameters an owner may take in): freeing a span
+    # and making a slightly larger one cut a new segment per layer on one
+    # Flash-Next rank, and the card ran out after ~20 layers
+    host, src = torch.empty(span, dtype=torch.uint8, pin_memory=True), None
+    for item in new:
+        src = getattr(item[1], item[2]) if item[0] == "owner" else layer.get_parameter(item[1])
+        _place(host, item).copy_(src)
+    _point(layer, host, new)
+    STATE["dev_spans"][i] = None
+    del found, src
+    in_place = span <= full.numel()
+    if in_place:
+        dspan = full[:span]
+    else:
+        STATE["dev_full"][i] = None
+        del full
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        with _tms().region(tag=TAG_WEIGHTS):
+            dspan = torch.empty(span, dtype=torch.uint8, device=device)
+        STATE["dev_full"][i] = dspan
+        counts["grown"] += 1
+    if DEBUG:
+        _log(f"relayout layer {i} on {device}: span {STATE['spans'][i]} -> {span} bytes "
+             f"({'in place' if in_place else 'new span'}), free {torch.cuda.mem_get_info(device)[0] >> 20} MiB, "
+             f"torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
+    dspan.copy_(host)
+    _point(layer, dspan, new)
+    STATE["dev_spans"][i] = dspan
+    STATE["layouts"][i] = new
+    STATE["spans"][i] = span
+    del host
+
+
+def after_module(module) -> None:
+    """The loader, after each module's weight processing: when that left a
+    lent layer's parameters outside its span (a repack makes new tensors),
+    take them back now, so the originals in the span and the repacked
+    copies do not pile up over the whole load (Vision-Exp with 12 Marlin hot
+    experts per layer ran out of memory that way)."""
+    if not ENABLED or STATE["phase"] != "load" or "dev_full" not in STATE:
+        return
+    i = getattr(module, "_kt_lend_layer", None)
+    if i is None:
+        return
+    full = STATE["dev_full"][i]
+    lo, hi = full.data_ptr(), full.data_ptr() + full.numel()
+    if all(lo <= q.data_ptr() < hi for n, q in STATE["layers"][i].named_parameters()
+           if q.is_cuda and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP)):
+        return
+    _relayout(i, dict(owners=0, grown=0, moved=0, dropped=0, aliases=0))
+    STATE["counts"]["early"] += 1
+
+
+def after_load() -> None:
+    """After every module's weight processing, before the KV pool: take back
+    what the loading rebound, move fused owners into the spans, mirror,
+    release scratch."""
+    if not ENABLED or "dev_spans" not in STATE or STATE["phase"] != "load":
+        return
+    counts = STATE["counts"]
+    device = STATE["device"]
+    if DEBUG:
+        _log(f"after_load on {device} (current {torch.cuda.current_device()}): free "
+             f"{torch.cuda.mem_get_info(device)[0] >> 20} MiB, torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
+    for i in range(len(STATE["layers"])):
+        _relayout(i, counts)
+    bases, total = [], 0
+    for span in STATE["spans"]:
+        bases.append(total)
+        total += span
+    host = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+    for base, span, dspan in zip(bases, STATE["spans"], STATE["dev_spans"]):
+        host[base:base + span].copy_(dspan)
+    STATE.update(host=host, bases=bases, nbytes=total)
+    maxspan = max(STATE["spans"])
+    if STATE["slots"][0].numel() < maxspan:
+        STATE["slots"] = None
+        STATE["slots"] = [scratch_empty((maxspan,), torch.uint8, device) for _ in range(2)]
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    _tms().pause(TAG_SCRATCH)
+    STATE["phase"] = "decode"
+    _log(f"weights {total / 1e9:.3f} GB mirrored ({counts['owners']} fused owners moved in, {counts['grown']} spans "
+         f"outgrown, {counts['moved']} parameters rebound or made by the loading taken in, {counts['aliases']} aliases, "
+         f"{counts['dropped']} gone, "
+         f"{counts['early']} layers taken back during the load"
+         + (f"; gone: {', '.join(sorted(counts['gone_names'])[:6])}" if counts.get("gone_names") else "")
+         + f"); scratch {STATE['scratch_bytes'] / 1e9:.3f} GB released "
+         f"until the first long prefill")
+
+
+# -- phase swap ------------------------------------------------------------------
+
+def _threshold() -> int:
+    """Rows from which a prefill does not need the resident MoE weights: the
+    KT streamer's KT_GPU_STREAM_PREFILL, or in a tree without the streamer
+    (GLM-5.3's) the full-GPU prefill's --kt-gpu-prefill-token-threshold."""
+    if "threshold" not in STATE:
+        try:
+            from sglang.srt.layers.moe.kt_stream_prefill import STREAM_THRESHOLD as t
+        except ImportError:
+            try:
+                from sglang.srt.server_args import get_global_server_args
+
+                t = int(getattr(get_global_server_args(), "kt_gpu_prefill_token_threshold", 0) or 0)
+            except Exception:
+                t = 0
+        STATE["threshold"] = t
+    return STATE["threshold"]
+
+
+def _streamed(forward_batch) -> bool:
+    t = _threshold()
+    if t <= 0 or not forward_batch.forward_mode.is_extend():
+        return False
+    return forward_batch.input_ids.shape[0] >= t
+
+
+def _chunk() -> int:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return int(get_global_server_args().chunked_prefill_size or 0)
+    except Exception:
+        return 0
+
+
+def _write_hint(rank: int) -> None:
+    import json
+
+    rows = STATE.get("pf_rows", 0)
+    chunk = _chunk()
+    if not HINT or rows < 4096 or chunk <= 0:
+        return
+    growth = STATE["pf_peak"] - STATE["pf_base"]
+    per_tok = growth / rows + STATE["scratch_chunk_bytes"] / chunk
+    room = STATE["pf_free"] - growth - MARGIN
+    hint = chunk + int(room / per_tok) if per_tok > 0 else chunk
+    # the cost per token grows with the rows (Flash-Next 371 -> 417 KB from
+    # 14336 to 16384 rows), so a far extrapolation is too hopeful: at most
+    # twice the running chunk per launch, the next launch measures again
+    hint = min(hint, 2 * chunk)
+    # a window that never filled a chunk says nothing about a larger one (a
+    # 6K-token window on Vision-Exp hinted 22528 from chunk 16384; the full
+    # 16384 rows then left no room): it may only lower the chunk
+    if rows < chunk:
+        hint = min(hint, chunk)
+    hint = max(2048, min(32768, hint // 2048 * 2048))
+    # the free memory at a window's start wobbles: keep the smallest
+    hint = min(hint, STATE.get("hint_min", hint))
+    STATE["hint_min"] = hint
+    rec = {"chunk": hint, "current_chunk": chunk, "rows_seen": rows,
+           "free_at_prefill_mb": STATE["pf_free"] >> 20, "peak_growth_mb": growth >> 20,
+           "margin_mb": MARGIN >> 20, "bytes_per_token": round(per_tok),
+           "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20}
+    with open(f"{HINT}-rank{rank}.json", "w") as f:
+        json.dump(rec, f)
+    if STATE.get("hint_logged") != hint:
+        STATE["hint_logged"] = hint
+        _log(f"chunk hint {hint} (now {chunk}): {rows} rows peaked {growth / 1e9:.2f} GB above the "
+             f"prefill baseline with {STATE['pf_free'] / 1e9:.2f} GB free, {per_tok / 1e3:.0f} KB a token "
+             f"with the chunk-sized scratch, margin {MARGIN / 1e9:.2f} GB")
+
+
+def before_forward(forward_batch) -> None:
+    """Model runner, before every forward, outside any graph."""
+    if not ENABLED or STATE["phase"] == "load":
+        return
+    streamed = _streamed(forward_batch)
+    rows = forward_batch.input_ids.shape[0]
+    if streamed and STATE["phase"] == "prefill":
+        STATE["pf_rows"] = max(STATE.get("pf_rows", 0), rows)
+    elif streamed and STATE["phase"] == "decode":
+        t = time.perf_counter()
+        dev = STATE["device"]
+        # free memory in decode, the KV pool and the graphs made: what is gone
+        # from it when the weights come back was left behind by this prefill
+        STATE["dec_free"] = torch.cuda.mem_get_info(dev)[0]
+        STATE.setdefault("dec_free0", STATE["dec_free"])
+        if DEBUG and not STATE.get("history"):
+            torch.cuda.memory._record_memory_history(max_entries=500000)
+            STATE["history"] = True
+        _tms().pause(TAG_WEIGHTS)
+        _tms().resume(TAG_SCRATCH)
+        torch.cuda.synchronize(dev)
+        STATE["pf_free"] = torch.cuda.mem_get_info(dev)[0]
+        STATE["pf_base"] = torch.cuda.memory_reserved(dev)
+        torch.cuda.reset_peak_memory_stats(dev)
+        STATE.update(phase="prefill", pf_issued=set(), pf_rows=rows)
+        STATE["to_prefill"] += 1
+        if STATE["to_prefill"] in (1, 10, 100, 1000):
+            _log(f"to prefill in {(time.perf_counter() - t) * 1e3:.1f} ms ({STATE['to_prefill']} so far)")
+    elif not streamed and STATE["phase"] == "prefill":
+        t = time.perf_counter()
+        dev = STATE["device"]
+        STATE["pf_peak"] = torch.cuda.max_memory_reserved(dev)
+        try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            rank = get_tensor_model_parallel_rank()
+        except Exception:
+            rank = dev.index
+        _write_hint(rank)
+        _leave()
+        torch.cuda.empty_cache()
+        _tms().pause(TAG_SCRATCH)
+        _check_room(dev)
+        _tms().resume(TAG_WEIGHTS)
+        for base, span, dspan in zip(STATE["bases"], STATE["spans"], STATE["dev_spans"]):
+            dspan.copy_(STATE["host"][base:base + span], non_blocking=True)
+        STATE["phase"] = "decode"
+        STATE["to_decode"] += 1
+        if STATE["to_decode"] in (1, 10, 100, 1000):
+            _log(f"to decode in {(time.perf_counter() - t) * 1e3:.1f} ms, copy queued "
+                 f"({STATE['to_decode']} so far)")
+
+
+def _check_room(dev) -> None:
+    """Before the weights come back: what the prefill left outside the lend
+    scratch is room they no longer have. Say how much, and stop with a reason
+    instead of torch_memory_saver failing to map them (a process abort)."""
+    free = torch.cuda.mem_get_info(dev)[0]
+    need = STATE["nbytes"] + len(STATE["spans"]) * (2 << 20)  # mapped in 2 MiB granules
+    left = STATE["dec_free"] + STATE["nbytes"] - free  # kept from this prefill window
+    total = STATE["dec_free0"] + STATE["nbytes"] - free  # since the first window
+    if DEBUG and left > 256 << 20 and not STATE.get("dumped"):
+        path = f"/tmp/kt-lend-kept-{dev.index}-w{STATE['to_decode'] + 1}.pickle"
+        torch.cuda.memory._dump_snapshot(path)
+        STATE["dumped"] = True
+        _log(f"memory snapshot {path}")
+    if left > 64 << 20:
+        _log(f"prefill window {STATE['to_decode'] + 1} on {dev} kept {left / 1e9:.2f} GB outside the lend "
+             f"scratch ({total / 1e9:.2f} GB since the first; the weights need {need / 1e9:.2f} GB, "
+             f"{free / 1e9:.2f} GB free)")
+    if free < need:
+        raise RuntimeError(
+            f"KT_PREFILL_LEND: the weights ({need / 1e9:.2f} GB) cannot come back on {dev}: "
+            f"{free / 1e9:.2f} GB free, {left / 1e9:.2f} GB was allocated during prefill outside the "
+            f"lend scratch and kept. Fewer GPU experts or a smaller KV pool leaves the room.")
+
+
+# -- per-layer streaming ---------------------------------------------------------
+
+def _prefetch(i: int) -> None:
+    if i >= len(STATE["spans"]) or i in STATE["pf_issued"]:
+        return
+    k = i % 2
+    base, span = STATE["bases"][i], STATE["spans"][i]
+    cs = STATE["pf_stream"]
+    with torch.cuda.stream(cs):
+        if STATE["pf_done"][k] is not None:
+            cs.wait_event(STATE["pf_done"][k])
+        n = STATE.get("active", {}).get(i, span)  # the idle tail stays out
+        STATE["slots"][k][:n].copy_(STATE["host"][base:base + n], non_blocking=True)
+        STATE["pf_ready"][k].record(cs)
+    STATE["pf_issued"].add(i)
+
+
+def _enter_hook(module, args):
+    _enter(module._kt_lend_idx)
+    return None
+
+
+def _enter(i: int) -> None:
+    """Layer i is about to run in a prefill: the previous layer goes back to
+    its span (its slot is free once the compute stream gets here), layer i
+    to its slot, layer i+1's copy starts."""
+    if STATE["phase"] != "prefill" or STATE.get("pf_cur") == i:
+        return
+    dev = STATE["device"]
+    if "pf_stream" not in STATE:
+        STATE["pf_stream"] = torch.cuda.Stream(device=dev)
+        STATE["pf_ready"] = [torch.cuda.Event(), torch.cuda.Event()]
+        STATE["pf_done"] = [None, None]
+    cur = torch.cuda.current_stream(dev)
+    prev = STATE.get("pf_cur")
+    if prev is not None:
+        _point(STATE["layers"][prev], STATE["dev_spans"][prev], STATE["layouts"][prev])
+        ev = torch.cuda.Event()
+        ev.record(cur)
+        STATE["pf_done"][prev % 2] = ev
+    if prev is None or i <= prev:
+        STATE["pf_issued"] = set()  # a new forward
+    if i not in STATE["pf_issued"]:
+        # nothing prefetched: the side stream must see the compute stream's past
+        STATE["pf_stream"].wait_stream(cur)
+        _prefetch(i)
+    cur.wait_event(STATE["pf_ready"][i % 2])
+    _point(STATE["layers"][i], STATE["slots"][i % 2], STATE["layouts"][i],
+           limit=STATE.get("active", {}).get(i))
+    STATE["pf_cur"] = i
+    _prefetch(i + 1)
+
+
+def _leave() -> None:
+    i = STATE.pop("pf_cur", None)
+    if i is not None:
+        _point(STATE["layers"][i], STATE["dev_spans"][i], STATE["layouts"][i])
