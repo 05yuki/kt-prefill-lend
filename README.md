@@ -25,6 +25,18 @@ window records free memory, peak growth and rows per rank, and the first
 launch of a setup runs one calibration launch (a ~60K-token prompt), halving
 the guess on out-of-memory.
 
+## Who this is for
+
+People who already run a KTransformers hybrid (kt-kernel built for their
+CPU, experts on the CPU, SGLang serving attention and hot experts on the GPU)
+and are comfortable patching an SGLang tree. This is not a packaged install:
+each model here runs on its own SGLang tree, the expert streamer the patches
+edit is not in upstream SGLang (it is under `streamers/`), and the DeepSeek V4
+zero-copy streamer also needs kt-kernel built with shared-memory expert arenas.
+Once applied, the lend needs no tuning: it is on by default in the launchers,
+the chunk is calibrated on the first launch, and a tree without the patch
+starts without it.
+
 ## Results
 
 2x RTX 5070 Ti 16 GB (PCIe 4.0 x16, no P2P), dual EPYC 7452, TP=2, all CPU
