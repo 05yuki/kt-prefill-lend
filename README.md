@@ -45,7 +45,7 @@ the same server without the lend.
 | DeepSeek V4.1-Flash MXFP4, 1M ctx | 5 | 2048 -> 6144 | 255 -> **576** | 259 -> **596** | 25.4-25.6 -> 27.6-28.0 | NLL z -1.90 ¹ |
 | DeepSeek V4-Flash-Vision MXFP4 | 10 -> 12 | 2048 -> 16384 | 601 -> **900-919** | 598 -> **849** | 36.5-39.9 -> 42.5-44.8 | NLL z -0.58 ¹ |
 | GLM-5.3-Flash NVFP4 experts | 0 -> 10 | 2048 -> 14336 | 163 -> **326-327** | 155 -> **292** | 18.3 -> 19.9-20.1 | NLL z -0.35 / -1.04 |
-| Qwen3.8-Flash-Next NVFP4 | 32 | 2048 -> 16384 | ~1,000 ² -> **4,123-4,145** | ~1,000 ² -> **4,604-4,608** (105K) | 57.8-59.4 | bit-identical |
+| Qwen3.8-Flash-Next NVFP4 | 32 | 2048 -> 16384 | 1,336-1,337 -> **4,153-4,154** | 1,367 -> **4,596** (105K) | 58.5-58.7 -> 54.8-59.3 | bit-identical ² |
 
 V4.1 keeps its whole 1,048,576-token KV pool and prefills a 989,154-token
 prompt to the end at chunk 6144 (2,433.9 s, the server's first prefill); see
@@ -76,7 +76,7 @@ base's run-to-run spread, with the same top-1.
 
 ¹ Measured on an earlier lend setup (MiMo at chunk 8192, V4.1 at chunk 4096,
 Vision at hot 10 and chunk 8192), not on the row's.
-² Provisional base: the lend was developed on this model from the start, so the base is the pre-lend record of 09-14 at chunk 2048 (an 8,169-token prompt in 7.99 s, 1,020 tok/s; 38K and 114K were not timed then). A same-day base at chunk 2048 is being measured and will replace it.
+² Base and lend measured the same day (10-07) with the same prompts and harness; the lend was developed on this model, so this base row came last. The KV pool also grows with the lend here, 231,616 -> 262,144 tokens.
 ³ Also bit-identical to itself after twelve prompts of different lengths
 with `KT_STREAM_GRAPH_KEEP=2`, which drops and re-captures the streamer's
 CUDA graphs. MiMo at 1,725 tokens: the base server split that prompt
