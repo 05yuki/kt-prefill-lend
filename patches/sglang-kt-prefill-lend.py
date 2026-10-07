@@ -109,7 +109,7 @@ for p, bad in ((W, "KT_HOT_ARENA"), (S, "_kt_hot"), (C, "_hot_arena_lending"), (
     if p.exists() and bad in p.read_text():
         raise SystemExit(f"{p.name} carries an earlier lend ({bad}): start from the files without it")
 
-LEND_SRC = Path(__file__).with_name("kt_lend.py")
+LEND_SRC = Path(__file__).resolve().parent.parent / "kt_lend.py"
 if LEND.exists() and LEND.read_text() == LEND_SRC.read_text():
     print("kt_lend.py already present")
 else:
@@ -162,6 +162,21 @@ edit(L, "kt_lend.after_module", [('''                with device_loading_context
                 kt_lend.after_module(module)
 
         # patches/sglang-kt-prefill-lend.py: before the KV pool is sized
+''')])
+
+# Flash-Next stacks in_proj_qkvz and in_proj_ba into one weight per layer at
+# the end of load_weights, after the originals moved into the spans: the
+# copies of all 48 layers sat on top of the spans at once and one card (TP=1)
+# ran out of memory there. Each layer goes back into its span right after.
+edit(M, "kt_lend.after_module(module)  # fused in_proj", [('''        for module in self.modules():
+            if isinstance(module, Qwen3_5GatedDeltaNet):
+                module.finalize_fused_in_proj()
+''', '''        for module in self.modules():
+            if isinstance(module, Qwen3_5GatedDeltaNet):
+                module.finalize_fused_in_proj()
+                from sglang.srt.layers.moe import kt_lend
+
+                kt_lend.after_module(module)  # fused in_proj
 ''')])
 
 edit(R, "kt_lend.before_forward", [('''        ):
@@ -243,11 +258,12 @@ edit(Q, "kt_lend.scratch_empty", [('''            w2 = layer.w2_weight  # [E_loc
                 from sglang.srt.server_args import get_global_server_args
 
                 key = w2.device.index
-                small = fp4_workspace_nbytes(
-                    max(STREAM_THRESHOLD, 1), w2.shape[1], w2.shape[2] * 2, w2.shape[0] * layer.moe_ep_size,
-                    layer.top_k, _activation_type(moe_runner_config), layer.moe_tp_size, layer.moe_tp_rank,
-                    layer.moe_ep_size, layer.moe_ep_rank, w2.device)
-                preallocate_shared_cutlass_workspace(small, w2.device)
+                if w2.shape[0]:  # no resident experts (hot 0): no call below the threshold
+                    small = fp4_workspace_nbytes(
+                        max(STREAM_THRESHOLD, 1), w2.shape[1], w2.shape[2] * 2, w2.shape[0] * layer.moe_ep_size,
+                        layer.top_k, _activation_type(moe_runner_config), layer.moe_tp_size, layer.moe_tp_rank,
+                        layer.moe_ep_size, layer.moe_ep_rank, w2.device)
+                    preallocate_shared_cutlass_workspace(small, w2.device)
                 if key not in _fc._lent_cutlass_workspace:
                     big = fp4_workspace_nbytes(
                         get_global_server_args().chunked_prefill_size, w2.shape[1], w2.shape[2] * 2,

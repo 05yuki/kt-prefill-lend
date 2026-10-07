@@ -60,7 +60,7 @@ def edit(path, marker, pairs):
     print("patched", path)
 
 
-LEND_SRC = Path(__file__).with_name("kt_lend.py")
+LEND_SRC = Path(__file__).resolve().parent.parent / "kt_lend.py"
 if LEND.exists() and LEND.read_text() == LEND_SRC.read_text():
     print("kt_lend.py already present")
 else:

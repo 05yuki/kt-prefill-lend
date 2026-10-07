@@ -38,6 +38,11 @@ def once(s, old, new):
 
 
 s = f.read_text(encoding="utf-8")
+# Whole-file check: sglang-dsv41-kt-prefill-lend.py later rewrites _gin_view,
+# so the per-edit check below would add a second copy on a re-run.
+if "KT_STREAM_SHARED_INPUTS" in s:
+    print(f"already patched {f}")
+    raise SystemExit(0)
 
 s = once(s,
     'ZEROCOPY = os.environ.get("KT_GPU_STREAM_ZEROCOPY") == "1"\n',

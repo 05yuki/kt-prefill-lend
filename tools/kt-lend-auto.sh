@@ -1,6 +1,6 @@
 # Sourced by a launcher under KT_PREFILL_LEND=1 (patches/kt_lend.py): picks the
 # prefill chunk from what the server measured, calibrating once when there is
-# nothing to go on. Flash-Next's launcher has its own copy of the same steps.
+# nothing to go on.
 #
 #   kt_lend_auto <launcher> <chunk env var> <port> <key part>...
 #
@@ -8,7 +8,8 @@
 # writes, keyed by the key parts: model, context, mem fraction, GPUs, hot
 # experts, ...) and KT_LEND_CHUNK:
 #   - the chunk env var when the user gave one;
-#   - else the smaller of the ranks' hints from an earlier launch;
+#   - else the smallest of the ranks' hints from an earlier launch (one file
+#     per rank; one rank is enough, so a single-GPU server works too);
 #   - else a calibration: the launcher started once in the background with
 #     KT_PREFILL_LEND_CALIBRATING=1 at a first guess from the card size, one
 #     ~50K-token prompt, the server stopped; out of memory halves the guess
@@ -21,11 +22,11 @@ _kt_lend_read_hint() {
   python3 - "$KT_PREFILL_LEND_HINT" <<'PY'
 import glob, json, sys
 hints = [json.load(open(f))["chunk"] for f in sorted(glob.glob(sys.argv[1] + "-rank*.json"))]
-print(min(hints) if len(hints) >= 2 else "")
+print(min(hints) if hints else "")
 PY
 }
 
-kt_lend_auto() {
+_kt_lend_auto_core() {
   local launcher="$1" chunk_var="$2" port="$3"
   shift 3
   local key
@@ -55,9 +56,23 @@ kt_lend_auto() {
   cal_chunk=16384
   (( vram_mb < 15000 )) && cal_chunk=8192
   (( vram_mb > 23000 )) && cal_chunk=24576
+  # no wider than the launcher allows (V4.1: the widest chunk that keeps the KV pool)
+  [[ -n "${KT_PREFILL_LEND_MAX_CHUNK:-}" ]] && (( cal_chunk > KT_PREFILL_LEND_MAX_CHUNK )) && \
+    cal_chunk="$KT_PREFILL_LEND_MAX_CHUNK"
+  # KT_PREFILL_LEND_PROBE_CONTEXT=<tokens> (a tree with sglang-kt-lend-probe.py):
+  # the calibration server measures the chunk with the lend probe at prefix 0,
+  # half the context and the context's end before it serves, instead of a
+  # ~50K-token prompt: what the chunk costs at the longest prompt the server
+  # will take, in a few minutes
+  local probe=""
+  if [[ -n "${KT_PREFILL_LEND_PROBE_CONTEXT:-}" ]]; then
+    probe="@0,$(( KT_PREFILL_LEND_PROBE_CONTEXT / 2 )),$(( KT_PREFILL_LEND_PROBE_CONTEXT - 8 * cal_chunk ))"
+  fi
   while (( cal_chunk >= 2048 )); do
     echo "no chunk hint for this setup yet: calibration launch at chunk $cal_chunk (${vram_mb} MiB cards; $cal_log)" >&2
-    env KT_PREFILL_LEND_CALIBRATING=1 "$chunk_var=$cal_chunk" bash "$launcher" --background >>"$cal_log" 2>&1 || {
+    [[ -n "$probe" ]] && probe="@${probe#*@}" && probe="$cal_chunk$probe"
+    env KT_PREFILL_LEND_CALIBRATING=1 "$chunk_var=$cal_chunk" ${probe:+KT_PREFILL_LEND_PROBE="$probe"} \
+      bash "$launcher" --background >>"$cal_log" 2>&1 || {
       echo "calibration launch failed to start; see $cal_log" >&2; return 5; }
     cal_run="$(sed -n -e 's/^Run directory: //p' -e 's/^log directory: //p' "$cal_log" | tail -1)"
     cal_pid="$(cat "$cal_run/server.pid" 2>/dev/null)"
@@ -68,7 +83,7 @@ kt_lend_auto() {
       if curl -sf -m 3 "http://127.0.0.1:$port/health" >/dev/null; then cal_ok=1; break; fi
       sleep 10
     done
-    if [[ "$cal_ok" == 1 ]]; then
+    if [[ "$cal_ok" == 1 && -z "$probe" ]]; then
       python3 - "$port" <<'PY' >>"$cal_log" 2>&1 || true
 import json, secrets, sys, time, urllib.request
 para = ("灯りの落ちた編集部で、彼女は原稿の束を繰っていた。窓の外は雨で、アスファルトの匂いが"
@@ -81,7 +96,10 @@ r = json.load(urllib.request.urlopen(req, timeout=3600))
 print(f"calibration prompt: {r['meta_info']['prompt_tokens']} tokens in {time.time() - t:.1f} s")
 PY
       for _ in $(seq 1 60); do
-        [[ "$(ls "$KT_PREFILL_LEND_HINT"-rank*.json 2>/dev/null | wc -l)" -ge 2 ]] && break
+        if ls "$KT_PREFILL_LEND_HINT"-rank*.json >/dev/null 2>&1; then
+          sleep 10  # the other ranks write theirs at the end of the same window
+          break
+        fi
         sleep 2
       done
     fi
@@ -113,10 +131,84 @@ PY
   fi
 }
 
+# The KV guard (KT_PREFILL_LEND_KV_CAP=<the max_total_tokens the launcher asks
+# for>): the lend takes nothing from the KV pool. Where a wider chunk widens the
+# SWA pool (DeepSeek V4, MiMo), that comes out of the full pool; so when the
+# last server of this setup got a smaller full pool than the reference, the
+# chunk it ran is remembered as one that cuts the KV pool and this launch goes
+# 1024 below it. The reference is the cap, or, where even chunk 2048 does not
+# reach it (memory, not the lend: MiMo on one card), the full pool at 2048.
+# Kept in <hint>-kv.json; the server rewrites the rank files every window.
+_kt_lend_kv_guard() {
+  [[ -n "${KT_PREFILL_LEND_KV_CAP:-}" ]] || return 0
+  local out
+  out="$(python3 - "$KT_PREFILL_LEND_HINT" "$KT_LEND_CHUNK" "$KT_PREFILL_LEND_KV_CAP" <<'EOF'
+import glob, json, sys
+prefix, chunk, cap = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+side_path = prefix + "-kv.json"
+try:
+    side = json.load(open(side_path))
+except Exception:
+    side = {}
+recs = []
+for f in glob.glob(prefix + "-rank*.json"):
+    try:
+        recs.append(json.load(open(f)))
+    except Exception:
+        pass
+full = min((r.get("full_tokens", 0) for r in recs), default=0)
+ran = max((r.get("current_chunk", 0) for r in recs), default=0)
+ref = side.get("ref", cap)
+note = ""
+if full > 0 and ran > 0 and full < ref * 0.9995:
+    if ran <= 2048:
+        side["ref"] = ref = full
+        note = f"full pool {full} below {cap} even at chunk {ran}: memory, not the lend; {full} is the reference now"
+    else:
+        side["cut_at"] = min(side.get("cut_at", ran), ran)
+        note = f"chunk {ran} left the full pool at {full} of {ref}: the KV pool comes first"
+if "cut_at" in side:
+    chunk = min(chunk, max(2048, side["cut_at"] - 1024))
+json.dump(side, open(side_path, "w"))
+print(chunk)
+print(note)
+EOF
+)" || return 0
+  local new note
+  new="$(sed -n 1p <<<"$out")"
+  note="$(sed -n 2p <<<"$out")"
+  [[ -n "$note" ]] && echo "KV guard: $note" >&2
+  if [[ -n "$new" && "$new" != "$KT_LEND_CHUNK" ]]; then
+    echo "KV guard: chunk $KT_LEND_CHUNK -> $new" >&2
+    KT_LEND_CHUNK="$new"
+  fi
+}
+
+# kt_lend_auto <launcher> <chunk env var> <port> <key part>...: the chunk
+# (the steps above), then the KV guard.
+kt_lend_auto() {
+  _kt_lend_auto_core "$@" || return $?
+  [[ -n "${!2:-}" ]] || _kt_lend_kv_guard
+}
+
 # The DeepSeek V4 / MiMo SWA pool is full_tokens x ratio and must hold one
-# chunk plus a page, or the server refuses to start: the ratio for a chunk,
-# never below the launcher's own.
+# chunk plus a page, or the server refuses to start or caps every prefill
+# batch below the chunk: the ratio for a chunk, never below the launcher's own.
+# The full pool is the cap only when memory allows. Where it does not (MiMo on
+# one card got 97,699 of 131072, so its SWA pool held each batch at 12.1K rows
+# of 15360), the KV pool is kept and the chunk is what gives: the launcher's
+# default. KT_PREFILL_LEND_SWA_FIT=1 sizes the ratio from the full pool an
+# earlier launch recorded instead, and the chunk wins: there MiMo went to
+# 13.9K rows and 40K prompts 1,107 -> 1,331 tok/s, but the full pool to 81,552
+# (39 sliding layers to 9 full ones: each SWA token costs several full ones).
 kt_lend_swa_ratio() {  # chunk max_total_tokens ratio
-  python3 -c "import sys; c, m, r = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]); \
-print(f'{max(r, (c + 512) * 1.02 / m):.4f}')" "$1" "$2" "$3"
+  python3 - "$1" "$2" "$3" "${KT_PREFILL_LEND_HINT:-}" "${KT_PREFILL_LEND_SWA_FIT:-0}" <<'PY'
+import glob, json, sys
+c, m, r, hint, fit = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), sys.argv[4], sys.argv[5] == "1"
+full = [json.load(open(f)).get("full_tokens", 0) for f in glob.glob(hint + "-rank*.json")] if hint and fit else []
+full = [f for f in full if f > 0]
+if full:
+    m = min(m, int(min(full) * 0.97))
+print(f"{max(r, (c + 512) * 1.02 / m):.4f}")
+PY
 }

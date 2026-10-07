@@ -57,7 +57,7 @@ layer i-1 ran) and starts layer i+1's copy.
 Chunk hint (KT_PREFILL_LEND_HINT=<prefix>): each prefill window measures the
 free memory at its start, torch's peak reserved growth and the largest
 forward; the rank writes <prefix>-rank<r>.json with the chunk that would
-still have fitted (margin KT_PREFILL_LEND_MARGIN_MB, 512), the smallest since
+still have fitted (margin KT_PREFILL_LEND_MARGIN_MB, 256), the smallest since
 the server started.
 
 Requires torch_memory_saver (hook mode "torch").
@@ -65,6 +65,7 @@ Requires torch_memory_saver (hook mode "torch").
 
 import contextlib
 import os
+from typing import Optional
 import time
 
 import torch
@@ -74,7 +75,10 @@ MIN_BYTES = int(os.environ.get("KT_PREFILL_LEND_MIN_BYTES", str(1 << 20)))
 TAG_WEIGHTS = "kt_lend_weights"
 TAG_SCRATCH = "kt_lend_scratch"
 HINT = os.environ.get("KT_PREFILL_LEND_HINT", "")
-MARGIN = int(os.environ.get("KT_PREFILL_LEND_MARGIN_MB", "512")) << 20
+# 256 MiB (was 512): what a window adds outside torch's allocator measured 0 to
+# 62 MiB over V4.1 and Qwen3.5 windows of 7K to 989K tokens (10-06); growth with
+# the sequence is in the measured peak of a window, not in this margin
+MARGIN = int(os.environ.get("KT_PREFILL_LEND_MARGIN_MB", "256")) << 20
 DEBUG = os.environ.get("KT_PREFILL_LEND_DEBUG", "0") == "1"
 SKIP = [w for w in os.environ.get("KT_PREFILL_LEND_SKIP", "engram").split(",") if w]
 # KT_PREFILL_LEND_IDLE: lent but not brought back layer by layer during a
@@ -83,6 +87,13 @@ SKIP = [w for w in os.environ.get("KT_PREFILL_LEND_SKIP", "engram").split(",") i
 # end of the span; only the part before them is copied into the slot, and they
 # keep pointing at the paused span, so a read faults instead of going wrong.
 IDLE = [w for w in os.environ.get("KT_PREFILL_LEND_IDLE", "").split(",") if w]
+# KT_PREFILL_LEND_LONG_SEQ: an extend below the streaming threshold still runs
+# lent when its sequence is this long (65536). A long prompt's last chunk, or a
+# short turn on a long conversation, makes prefix-sized buffers (V4.1's indexer
+# gathers every compressed K: 484 MiB at a 989K-token prefix) that a card with
+# its weights and KV pool back does not have room for (10-06). Not with IDLE:
+# its weights are not brought back for a forward the streamer does not take.
+LONG_SEQ = int(os.environ.get("KT_PREFILL_LEND_LONG_SEQ", "65536"))
 
 STATE = {"phase": "load", "scratch_bytes": 0, "scratch_chunk_bytes": 0, "to_prefill": 0, "to_decode": 0}
 _saver = None
@@ -456,10 +467,14 @@ def _threshold() -> int:
 
 
 def _streamed(forward_batch) -> bool:
+    """A forward that runs in the lend window: a streamed prefill, or an extend
+    over a long sequence (KT_PREFILL_LEND_LONG_SEQ)."""
     t = _threshold()
     if t <= 0 or not forward_batch.forward_mode.is_extend():
         return False
-    return forward_batch.input_ids.shape[0] >= t
+    if forward_batch.input_ids.shape[0] >= t:
+        return True
+    return LONG_SEQ > 0 and not IDLE and _seq_len(forward_batch) >= LONG_SEQ
 
 
 def _chunk() -> int:
@@ -471,12 +486,21 @@ def _chunk() -> int:
         return 0
 
 
+def _seq_len(forward_batch) -> int:
+    """The longest sequence in a forward, prompt so far included (CPU copy only)."""
+    lens = getattr(forward_batch, "seq_lens_cpu", None)
+    try:
+        return int(lens.max()) if lens is not None and len(lens) else 0
+    except Exception:
+        return 0
+
+
 def _write_hint(rank: int) -> None:
     import json
 
     rows = STATE.get("pf_rows", 0)
     chunk = _chunk()
-    if not HINT or rows < 4096 or chunk <= 0:
+    if not HINT or rows < 2048 or chunk <= 0:
         return
     growth = STATE["pf_peak"] - STATE["pf_base"]
     per_tok = growth / rows + STATE["scratch_chunk_bytes"] / chunk
@@ -489,23 +513,111 @@ def _write_hint(rank: int) -> None:
     # a window that never filled a chunk says nothing about a larger one (a
     # 6K-token window on Vision-Exp hinted 22528 from chunk 16384; the full
     # 16384 rows then left no room): it may only lower the chunk
-    if rows < chunk:
-        hint = min(hint, chunk)
-    hint = max(2048, min(32768, hint // 2048 * 2048))
+    keep_min = True
+    if rows < 4096:
+        # too few rows to say anything about the chunk; still a point below
+        hint = min(chunk, STATE.get("hint_min", chunk))
+        keep_min = False
+    elif rows < chunk and hint >= chunk:
+        # nothing learned about a larger chunk: keep the running one on record
+        # (a launcher needs a value: MiMo's SWA pool held every window of the
+        # calibration at 12.4K rows of 16384, and without a file it fell back
+        # to 2048), but out of hint_min, which would pin it there for good
+        # (10-06: Qwen3.5 TP=1 stayed at 23552 behind one 5.5K-token window)
+        hint = min(chunk, STATE.get("hint_min", chunk))
+        keep_min = False
+    # 1024 steps: whole pages for every model here (pages of 1 to 256), and 2048
+    # steps threw away up to 2047 rows (V4.1: 7,462 measured, 6,144 hinted)
+    hint = max(2048, min(32768, hint // 1024 * 1024))
     # the free memory at a window's start wobbles: keep the smallest
     hint = min(hint, STATE.get("hint_min", hint))
-    STATE["hint_min"] = hint
+    if keep_min:
+        STATE["hint_min"] = hint
     rec = {"chunk": hint, "current_chunk": chunk, "rows_seen": rows,
            "free_at_prefill_mb": STATE["pf_free"] >> 20, "peak_growth_mb": growth >> 20,
            "margin_mb": MARGIN >> 20, "bytes_per_token": round(per_tok),
-           "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20}
-    with open(f"{HINT}-rank{rank}.json", "w") as f:
+           "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20,
+           # the longest sequence of the window, and the full KV pool the server
+           # got (kt_lend_swa_ratio sizes an SWA pool from it, not from the cap)
+           "seq_seen": STATE.get("pf_seq", 0), "full_tokens": STATE.get("full_tokens", 0)}
+    # the window as a point of the cost per row against the sequence length,
+    # merged with the points earlier launches of this setup left (one per
+    # power-of-two sequence bucket, the costlier kept): kt_lend_table builds
+    # the prefix -> chunk table of KT_PREFILL_LEND_DYNAMIC from them
+    path = f"{HINT}-rank{rank}.json"
+    points = STATE.get("points")
+    if points is None:
+        try:
+            with open(path) as f:
+                points = {int(k): v for k, v in json.load(f).get("points", {}).items()}
+        except Exception:
+            points = {}
+    seq = STATE.get("pf_seq", 0)
+    # a window of 2048 rows or more says what a row costs at this length (with
+    # the dynamic chunk a long prompt's windows are narrower than the launch
+    # chunk, and they are exactly the points the table lacks)
+    if seq > 0 and rows >= 2048:
+        bucket = seq.bit_length()
+        old = points.get(bucket)
+        if old is None or per_tok > old["per_row"]:
+            points[bucket] = {"seq": seq, "per_row": round(per_tok), "free": STATE["pf_free"],
+                              "rows": rows}
+    STATE["points"] = points
+    rec["points"] = points
+    with open(path, "w") as f:
         json.dump(rec, f)
     if STATE.get("hint_logged") != hint:
         STATE["hint_logged"] = hint
         _log(f"chunk hint {hint} (now {chunk}): {rows} rows peaked {growth / 1e9:.2f} GB above the "
              f"prefill baseline with {STATE['pf_free'] / 1e9:.2f} GB free, {per_tok / 1e3:.0f} KB a token "
              f"with the chunk-sized scratch, margin {MARGIN / 1e9:.2f} GB")
+
+
+def table_chunk(prefix: int, table: Optional[dict] = None) -> Optional[int]:
+    """The chunk for a request whose prompt has reached prefix tokens, from
+    KT_PREFILL_LEND_TABLE (built at launch by tools/kt-lend-auto.sh from the
+    points of every rank, so all ranks answer the same): the largest c with
+    c * cost(prefix + c) <= free - margin, cost per row interpolated between
+    the measured sequence lengths and, past the last one, taken to grow with
+    the sequence. None when there is no table."""
+    if table is None:
+        table = STATE.get("table")
+        if table is None:
+            import json
+
+            raw = os.environ.get("KT_PREFILL_LEND_TABLE", "")
+            try:
+                table = json.loads(raw) if raw else {}
+            except Exception:
+                table = {}
+            STATE["table"] = table
+    pts = sorted((p["seq"], p["per_row"]) for p in table.get("points", []))
+    if not pts:
+        return None
+    room = table["free"] - table.get("margin", MARGIN)
+    top, step = int(table["max"]), int(table.get("step", 1024))
+
+    def cost(s):
+        if s <= pts[0][0]:
+            return pts[0][1]
+        for (s0, c0), (s1, c1) in zip(pts, pts[1:]):
+            if s <= s1:
+                return c0 + (c1 - c0) * (s - s0) / max(1, s1 - s0)
+        # past the longest measured sequence: the cost per row is assumed to
+        # grow with the sequence (V4.1 doubled from 510K to 989K while it was
+        # flat from 38K to 510K), or along the last slope if that is steeper;
+        # a longer prompt adds its own point and loosens this
+        s1, c1 = pts[-1]
+        grown = c1 * s / s1
+        if len(pts) == 1:
+            return grown
+        s0, c0 = pts[-2]
+        return max(grown, c1 + max(0.0, (c1 - c0) / max(1, s1 - s0)) * (s - s1))
+
+    c = top
+    while c > 2048 and c * cost(prefix + c) > room:
+        c -= step
+    return max(2048, c)  # no narrower than the chunk without the lend
 
 
 def before_forward(forward_batch) -> None:
@@ -516,6 +628,15 @@ def before_forward(forward_batch) -> None:
     rows = forward_batch.input_ids.shape[0]
     if streamed and STATE["phase"] == "prefill":
         STATE["pf_rows"] = max(STATE.get("pf_rows", 0), rows)
+        seq = _seq_len(forward_batch)
+        STATE["pf_seq"] = max(STATE.get("pf_seq", 0), seq)
+        if LONG_SEQ > 0 and seq >= LONG_SEQ:
+            # Past a long prefix every chunk's prefix-sized buffers (page tables,
+            # the indexer's gathered K) are a little larger than the last one's,
+            # so the freed ones do not fit them and torch's cache fills with
+            # pieces: at a 999K-token prefix 5,624 MiB reserved for 2,927 MiB
+            # allocated (10-07). Hand the unused segments back before each chunk.
+            torch.cuda.empty_cache()
     elif streamed and STATE["phase"] == "decode":
         t = time.perf_counter()
         dev = STATE["device"]
@@ -529,17 +650,65 @@ def before_forward(forward_batch) -> None:
         _tms().pause(TAG_WEIGHTS)
         _tms().resume(TAG_SCRATCH)
         torch.cuda.synchronize(dev)
+        # what decode freed (the last prefill's attention metadata, released at
+        # the first graph replay) sits in torch's cache, which mem_get_info
+        # counts as used: hand it back so the free memory measured is real
+        torch.cuda.empty_cache()
         STATE["pf_free"] = torch.cuda.mem_get_info(dev)[0]
         STATE["pf_base"] = torch.cuda.memory_reserved(dev)
+        if DEBUG:
+            # what the device holds outside torch (graphs, modules, NCCL) is
+            # total - free - reserved; a rise across windows is not torch's
+            total = torch.cuda.mem_get_info(dev)[1]
+            _log(f"prefill window {STATE['to_prefill'] + 1} start on {dev}: free {STATE['pf_free'] >> 20} MiB, "
+                 f"torch reserved {STATE['pf_base'] >> 20} MiB, allocated "
+                 f"{torch.cuda.memory_allocated(dev) >> 20} MiB, outside torch "
+                 f"{(total - STATE['pf_free'] - STATE['pf_base']) >> 20} MiB")
         torch.cuda.reset_peak_memory_stats(dev)
-        STATE.update(phase="prefill", pf_issued=set(), pf_rows=rows)
+        STATE["pf_outside"] = torch.cuda.mem_get_info(dev)[1] - STATE["pf_free"] - STATE["pf_base"]
+        STATE["pf_abase"] = torch.cuda.memory_allocated(dev)
+        if "full_tokens" not in STATE:
+            # the full KV pool the server got, from the ModelRunner that calls
+            # this (no tree here puts the pool on the batch, and the attention
+            # backends differ): max_total_num_tokens after memory profiling
+            try:
+                import inspect
+
+                runner = inspect.currentframe().f_back.f_locals.get("self")
+                STATE["full_tokens"] = int(getattr(runner, "max_total_num_tokens", 0) or 0)
+            except Exception:
+                STATE["full_tokens"] = 0
+        STATE.update(phase="prefill", pf_issued=set(), pf_rows=rows, pf_seq=_seq_len(forward_batch))
         STATE["to_prefill"] += 1
         if STATE["to_prefill"] in (1, 10, 100, 1000):
             _log(f"to prefill in {(time.perf_counter() - t) * 1e3:.1f} ms ({STATE['to_prefill']} so far)")
     elif not streamed and STATE["phase"] == "prefill":
+        end_window()
+
+
+def end_window() -> None:
+    """Close a prefill window: record it, bring the weights back. The model
+    runner does this before the first forward after a prefill; the probe
+    (kt_lend_probe.py) calls it after each of its forwards."""
+    if not ENABLED or STATE["phase"] != "prefill":
+        return
+    if True:
         t = time.perf_counter()
         dev = STATE["device"]
         STATE["pf_peak"] = torch.cuda.max_memory_reserved(dev)
+        if DEBUG:
+            # one line a window for fitting the growth to rows and sequence
+            # length; "outside torch" is how much more the device held outside
+            # torch's allocator at the end than at the start (NCCL, cuBLAS,
+            # graphs; a transient that is gone by the end does not show)
+            free_now, total = torch.cuda.mem_get_info(dev)
+            outside = total - free_now - torch.cuda.memory_reserved(dev)
+            _log(f"prefill window {STATE['to_prefill']} on {dev}: rows {STATE.get('pf_rows', 0)}, "
+                 f"seq {STATE.get('pf_seq', 0)}, peak growth "
+                 f"{(STATE['pf_peak'] - STATE['pf_base']) >> 20} MiB of {STATE['pf_free'] >> 20} MiB free "
+                 f"(allocated {(torch.cuda.max_memory_allocated(dev) - STATE.get('pf_abase', 0)) >> 20} MiB), "
+                 f"outside torch {(outside - STATE['pf_outside']) >> 20:+d} MiB, full pool "
+                 f"{STATE.get('full_tokens', 0)}")
         try:
             from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -569,12 +738,13 @@ def _check_room(dev) -> None:
     need = STATE["nbytes"] + len(STATE["spans"]) * (2 << 20)  # mapped in 2 MiB granules
     left = STATE["dec_free"] + STATE["nbytes"] - free  # kept from this prefill window
     total = STATE["dec_free0"] + STATE["nbytes"] - free  # since the first window
-    if DEBUG and left > 256 << 20 and not STATE.get("dumped"):
+    if DEBUG and (left > 256 << 20 or total > 384 << 20) and not STATE.get("dumped"):
         path = f"/tmp/kt-lend-kept-{dev.index}-w{STATE['to_decode'] + 1}.pickle"
         torch.cuda.memory._dump_snapshot(path)
         STATE["dumped"] = True
         _log(f"memory snapshot {path}")
-    if left > 64 << 20:
+    # DEBUG: every window, so a slow pile-up under 64 MB a window shows too
+    if left > 64 << 20 or DEBUG:
         _log(f"prefill window {STATE['to_decode'] + 1} on {dev} kept {left / 1e9:.2f} GB outside the lend "
              f"scratch ({total / 1e9:.2f} GB since the first; the weights need {need / 1e9:.2f} GB, "
              f"{free / 1e9:.2f} GB free)")
