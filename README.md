@@ -1,7 +1,25 @@
-# kt-prefill-lend
+# Borrowed Prefill
 
-Lend the GPU-resident weights of a KTransformers + SGLang server to its long
-prefills, and take them back before decode.
+**During a prefill the GPU's dense weights sit idle. Borrow their VRAM for the
+prefill chunk, give it back before decode: a KTransformers + SGLang hybrid
+prefills 3-4x faster on the same card, with the same KV pool.**
+
+Qwen3.8-Flash-Next (NVFP4 MoE, 2x RTX 5070 Ti 16 GB, dual EPYC 7452):
+
+| | without | with Borrowed Prefill |
+|---|---|---|
+| 38K-token prompt | 1,337 tok/s | **4,154 tok/s** |
+| 105K-token prompt | 1,367 tok/s | **4,596 tok/s** |
+| decode | 58.5 tok/s | 59.3 tok/s |
+| KV pool | 231,616 tokens | 262,144 tokens |
+| output | | bit-identical |
+
+Same day, same prompts, same server; the only change is the lend
+(the project's name for the mechanism; `kt-prefill-lend` is the repo).
+Five more models, including DeepSeek V4.1 at a 1M-token context, are in
+[Results](#results).
+
+## How it works
 
 In a KTransformers hybrid (CPU experts, GPU attention and hot experts), a long
 prompt is prefilled by streaming the CPU-resident experts over PCIe into the
@@ -18,6 +36,23 @@ the *scratch*, that is resident only during prefill. Everything is back
 before the next decode step. The prefill gets several GB more, the chunk
 grows, and the forward count drops. By default the KV pool keeps every token
 it would have without the lend.
+
+## Ten minutes to try it
+
+On a server you already run (the trees and the streamer are described under
+[Who this is for](#who-this-is-for)):
+
+```sh
+pip install torch_memory_saver==0.0.9.post1          # in the server's venv
+python patches/sglang-kt-stream-graph-keep.py <sglang tree>
+python patches/sglang-kt-stream-shared-graph-inputs.py <sglang tree>   # DeepSeek V4 trees only
+python patches/sglang-kt-prefill-lend.py <sglang tree>                 # or the patch for your tree, see Applying it
+KT_PREFILL_LEND=1 <your launcher>                                      # first launch calibrates the chunk, ~2 min
+```
+
+Then send a long prompt and watch `nvidia-smi`: the usage climbs for the
+prefill and drops back for decode. `tools/kt-lend-auto.sh` has the launcher
+side (calibration, the KV guard); `KT_PREFILL_LEND=0` turns it off.
 
 ## Who this is for
 
@@ -40,12 +75,12 @@ the same server without the lend.
 
 | Model | hot experts | chunk | 38K prompt | 114K prompt | decode | quality vs base |
 |---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next NVFP4 | 32 | 2048 -> 16384 | 1,336-1,337 -> **4,153-4,154** | 1,367 -> **4,596** (105K) | 58.5-58.7 -> 54.8-59.3 | bit-identical ² |
 | Qwen3.5-35B-A3B bf16 | 48 | 2048 -> 32768 | 1,568 -> **6,492-6,507** | 1,533 -> **6,406** | 91-97 -> 98-100 | bit-identical |
 | MiMo-V2.6-Flash MXFP4 | 12 | 2048 -> 22528 | 525 -> **1,962-1,978** | 496 -> **1,550** | 30-32 -> 32 | top-20 spread unchanged ¹ |
 | DeepSeek V4.1-Flash MXFP4, 1M ctx | 5 | 2048 -> 6144 | 255 -> **576** | 259 -> **596** | 25.4-25.6 -> 27.6-28.0 | NLL z -1.90 ¹ |
 | DeepSeek V4-Flash-Vision MXFP4 | 10 -> 12 | 2048 -> 16384 | 601 -> **900-919** | 598 -> **849** | 36.5-39.9 -> 42.5-44.8 | NLL z -0.58 ¹ |
 | GLM-5.3-Flash NVFP4 experts | 0 -> 10 | 2048 -> 14336 | 163 -> **326-327** | 155 -> **292** | 18.3 -> 19.9-20.1 | NLL z -0.35 / -1.04 |
-| Qwen3.8-Flash-Next NVFP4 | 32 | 2048 -> 16384 | 1,336-1,337 -> **4,153-4,154** | 1,367 -> **4,596** (105K) | 58.5-58.7 -> 54.8-59.3 | bit-identical ² |
 
 V4.1 keeps its whole 1,048,576-token KV pool and prefills a 989,154-token
 prompt to the end at chunk 6144 (2,433.9 s, the server's first prefill); see
