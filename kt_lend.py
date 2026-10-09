@@ -87,6 +87,13 @@ SKIP = [w for w in os.environ.get("KT_PREFILL_LEND_SKIP", "engram").split(",") i
 # end of the span; only the part before them is copied into the slot, and they
 # keep pointing at the paused span, so a read faults instead of going wrong.
 IDLE = [w for w in os.environ.get("KT_PREFILL_LEND_IDLE", "").split(",") if w]
+# KT_PREFILL_LEND_PFONLY: lent weights only the prefill reads (Flash-Next's bf16
+# hyper-connection mix; decode runs int8 copies): in the mirror and the slot
+# copy, laid out at the end of the layer, but not in the decode span; outside a
+# layer's prefill turn they point at an empty tensor (kt-lend-prefill-only.py)
+PFONLY = [w for w in os.environ.get("KT_PREFILL_LEND_PFONLY", "").split(",") if w]
+if PFONLY and IDLE:
+    raise RuntimeError("KT_PREFILL_LEND_PFONLY and KT_PREFILL_LEND_IDLE do not combine")
 # KT_PREFILL_LEND_LONG_SEQ: an extend below the streaming threshold still runs
 # lent when its sequence is this long (65536). A long prompt's last chunk, or a
 # short turn on a long conversation, makes prefix-sized buffers (V4.1's indexer
@@ -192,6 +199,21 @@ def _point(layer, dspan, layout, limit=None) -> None:
                 layer.get_parameter(name).data = dspan[off + delta:off + delta + pnb].view(pdtype).view(pshape)
 
 
+def _pfonly_empty(layer, layout, dec) -> None:
+    """The layer's prefill-only weights (placed at or after dec) point at empty tensors."""
+    for item in layout:
+        if item[0] == "param" and item[4] >= dec:
+            layer.get_parameter(item[1]).data = torch.empty(0, dtype=item[3], device=STATE["device"])
+
+
+def _point_back(i: int) -> None:
+    """Layer i back at its decode span (prefill-only weights at empty tensors)."""
+    dec = STATE.get("dec_end", {}).get(i)
+    _point(STATE["layers"][i], STATE["dev_spans"][i], STATE["layouts"][i], limit=dec)
+    if dec is not None and dec < STATE["spans"][i]:
+        _pfonly_empty(STATE["layers"][i], STATE["layouts"][i], dec)
+
+
 def bind_model(model) -> None:
     """Right after the model is built: each decoder layer's large CUDA
     parameters move into one span of their own, layer by layer."""
@@ -202,7 +224,7 @@ def bind_model(model) -> None:
     for layer in layers:
         lay, off, slack = [], 0, 0
         for name, p in layer.named_parameters():
-            if p.device.type != "cuda" or not p.is_contiguous() or any(w in name for w in SKIP):
+            if p.device.type != "cuda" or not p.is_contiguous() or any(w in name for w in SKIP + PFONLY):
                 continue
             if _nbytes(p) < MIN_BYTES:
                 # room for it in case the loading stacks it into a fused
@@ -325,14 +347,22 @@ def _relayout(i: int, counts) -> None:
     # what the loading made anew (a repack under another name) and is big
     # enough is lent too
     names += [n for n, q in params.items() if n not in names and q.is_cuda and q.is_contiguous()
-              and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP)]
-    names = ([n for n in names if not any(w in n for w in IDLE)]
-             + [n for n in names if any(w in n for w in IDLE)])
-    active = None
+              and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP)
+              and (STATE.get("final") or not any(w in n for w in PFONLY))]
+    # prefill-only weights only in after_load's final pass: a layer laid out
+    # again during the load (after_module) keeps them in its span, or the
+    # final pass would find them emptied
+    pfonly = PFONLY if STATE.get("final") else []
+    names = ([n for n in names if not any(w in n for w in IDLE + pfonly)]
+             + [n for n in names if any(w in n for w in IDLE)]
+             + [n for n in names if any(w in n for w in pfonly)])
+    active = pfo = None
     for name in names:
         q = params.get(name)
         if active is None and any(w in name for w in IDLE):
             active = off
+        if pfo is None and any(w in name for w in pfonly):
+            pfo = off
         if name in inner_names or q is None or not q.is_cuda or not q.is_contiguous():
             if q is None:
                 # a second name for a parameter registered under another one
@@ -353,6 +383,8 @@ def _relayout(i: int, counts) -> None:
     params = q = None
     span = _align(off)
     STATE.setdefault("active", {})[i] = span if active is None else active
+    dec = span if pfo is None else pfo
+    STATE.setdefault("dec_end", {})[i] = dec
     # through pinned host memory, back into the same span (the bind left
     # room for the small parameters an owner may take in): freeing a span
     # and making a slightly larger one cut a new segment per layer on one
@@ -364,24 +396,31 @@ def _relayout(i: int, counts) -> None:
     _point(layer, host, new)
     STATE["dev_spans"][i] = None
     del found, src
-    in_place = span <= full.numel()
+    # the decode span ends before the prefill-only weights; one that would keep
+    # 1 MiB or more of them is made anew so the memory goes back
+    shrink = dec < span and full.numel() - dec >= (1 << 20)
+    in_place = dec <= full.numel() and not shrink
     if in_place:
-        dspan = full[:span]
+        dspan = full[:dec]
     else:
         STATE["dev_full"][i] = None
         del full
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         with _tms().region(tag=TAG_WEIGHTS):
-            dspan = torch.empty(span, dtype=torch.uint8, device=device)
+            dspan = torch.empty(dec, dtype=torch.uint8, device=device)
         STATE["dev_full"][i] = dspan
         counts["grown"] += 1
     if DEBUG:
         _log(f"relayout layer {i} on {device}: span {STATE['spans'][i]} -> {span} bytes "
              f"({'in place' if in_place else 'new span'}), free {torch.cuda.mem_get_info(device)[0] >> 20} MiB, "
              f"torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
-    dspan.copy_(host)
-    _point(layer, dspan, new)
+    dspan.copy_(host[:dec])
+    _point(layer, dspan, new, limit=dec)
+    if dec < span:
+        _pfonly_empty(layer, new, dec)
+        # the mirror is built from this copy (the span no longer holds it all)
+        STATE.setdefault("relayout_host", {})[i] = host
     STATE["dev_spans"][i] = dspan
     STATE["layouts"][i] = new
     STATE["spans"][i] = span
@@ -402,7 +441,7 @@ def after_module(module) -> None:
     full = STATE["dev_full"][i]
     lo, hi = full.data_ptr(), full.data_ptr() + full.numel()
     if all(lo <= q.data_ptr() < hi for n, q in STATE["layers"][i].named_parameters()
-           if q.is_cuda and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP)):
+           if q.is_cuda and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP + PFONLY)):
         return
     _relayout(i, dict(owners=0, grown=0, moved=0, dropped=0, aliases=0))
     STATE["counts"]["early"] += 1
@@ -419,6 +458,7 @@ def after_load() -> None:
     if DEBUG:
         _log(f"after_load on {device} (current {torch.cuda.current_device()}): free "
              f"{torch.cuda.mem_get_info(device)[0] >> 20} MiB, torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
+    STATE["final"] = True
     for i in range(len(STATE["layers"])):
         _relayout(i, counts)
     bases, total = [], 0
@@ -426,9 +466,16 @@ def after_load() -> None:
         bases.append(total)
         total += span
     host = torch.empty(total, dtype=torch.uint8, pin_memory=True)
-    for base, span, dspan in zip(bases, STATE["spans"], STATE["dev_spans"]):
-        host[base:base + span].copy_(dspan)
-    STATE.update(host=host, bases=bases, nbytes=total)
+    kept = STATE.pop("relayout_host", {})
+    for i, (base, span, dspan) in enumerate(zip(bases, STATE["spans"], STATE["dev_spans"])):
+        host[base:base + span].copy_(kept[i] if i in kept else dspan)
+    del kept
+    if PFONLY:
+        dec_total = sum(d.numel() for d in STATE["dev_spans"])
+        _log(f"prefill-only weights ({','.join(PFONLY)}): {(total - dec_total) / 1e9:.3f} GB kept out of the "
+             f"decode spans ({dec_total / 1e9:.3f} GB resident)")
+    STATE.update(host=host, bases=bases, nbytes=total,
+                 dec_nbytes=sum(d.numel() for d in STATE["dev_spans"]))
     maxspan = max(STATE["spans"])
     if STATE["slots"][0].numel() < maxspan:
         STATE["slots"] = None
@@ -722,7 +769,7 @@ def end_window() -> None:
         _check_room(dev)
         _tms().resume(TAG_WEIGHTS)
         for base, span, dspan in zip(STATE["bases"], STATE["spans"], STATE["dev_spans"]):
-            dspan.copy_(STATE["host"][base:base + span], non_blocking=True)
+            dspan.copy_(STATE["host"][base:base + dspan.numel()], non_blocking=True)
         STATE["phase"] = "decode"
         STATE["to_decode"] += 1
         if STATE["to_decode"] in (1, 10, 100, 1000):
@@ -735,9 +782,10 @@ def _check_room(dev) -> None:
     scratch is room they no longer have. Say how much, and stop with a reason
     instead of torch_memory_saver failing to map them (a process abort)."""
     free = torch.cuda.mem_get_info(dev)[0]
-    need = STATE["nbytes"] + len(STATE["spans"]) * (2 << 20)  # mapped in 2 MiB granules
-    left = STATE["dec_free"] + STATE["nbytes"] - free  # kept from this prefill window
-    total = STATE["dec_free0"] + STATE["nbytes"] - free  # since the first window
+    back = STATE.get("dec_nbytes", STATE["nbytes"])  # the decode spans (prefill-only weights stay out)
+    need = back + len(STATE["spans"]) * (2 << 20)  # mapped in 2 MiB granules
+    left = STATE["dec_free"] + back - free  # kept from this prefill window
+    total = STATE["dec_free0"] + back - free  # since the first window
     if DEBUG and (left > 256 << 20 or total > 384 << 20) and not STATE.get("dumped"):
         path = f"/tmp/kt-lend-kept-{dev.index}-w{STATE['to_decode'] + 1}.pickle"
         torch.cuda.memory._dump_snapshot(path)
@@ -791,7 +839,7 @@ def _enter(i: int) -> None:
     cur = torch.cuda.current_stream(dev)
     prev = STATE.get("pf_cur")
     if prev is not None:
-        _point(STATE["layers"][prev], STATE["dev_spans"][prev], STATE["layouts"][prev])
+        _point_back(prev)
         ev = torch.cuda.Event()
         ev.record(cur)
         STATE["pf_done"][prev % 2] = ev
@@ -811,4 +859,4 @@ def _enter(i: int) -> None:
 def _leave() -> None:
     i = STATE.pop("pf_cur", None)
     if i is not None:
-        _point(STATE["layers"][i], STATE["dev_spans"][i], STATE["layouts"][i])
+        _point_back(i)

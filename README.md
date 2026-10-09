@@ -266,6 +266,12 @@ full pool. The lend takes nothing from the KV pool by default:
   back during a prefill, for weights the prefill never reads (GLM's hot
   experts; measured within 1%, so off by default). Turns `LONG_SEQ`'s first
   part off.
+- `KT_PREFILL_LEND_PFONLY` — parameter-name substrings only the prefill
+  reads: the lend in reverse, decode borrowing the prefill's memory. Such a
+  weight stays out of the decode spans (it is in the pinned mirror and in the
+  prefill's layer slots, nowhere else), so decode gets its VRAM back. While
+  decoding it is an empty tensor: the model must not read it then. Not
+  combinable with `IDLE`. See "The lend in reverse" below.
 - `KT_PREFILL_LEND_HINT` — where the measurement is written (set by
   `kt-lend-auto.sh`).
 - `KT_PREFILL_LEND_KV_CAP`, `KT_PREFILL_LEND_PROBE_CONTEXT`,
@@ -278,6 +284,36 @@ full pool. The lend takes nothing from the KV pool by default:
 - `KT_PREFILL_LEND_DEBUG=1` — memory per prefill (reserved and allocated, and
   how much more the device held outside torch at the end), and a torch memory
   snapshot when a prefill leaves more than 256 MB outside the scratch.
+
+## The lend in reverse
+
+The lend gives decode's weights to the prefill. Some weights are the other way
+round: only the prefill reads them. On Flash-Next served from a GGUF, the
+hyper-connection mix runs from int8 copies in decode (16 rows or fewer), and
+its bf16 weights — 1.26 GB per card, rounded to the int8 values so both paths
+compute the same thing — are read only by the prefill. With
+`KT_PREFILL_LEND_PFONLY=input_mix_weight`:
+
+- the bind leaves them out of the spans (a span that later dropped part of
+  itself would keep that memory in torch_memory_saver's pool);
+- after the load they are laid out at the end of their layer, go into the
+  mirror and the prefill slots, the decode span ends before them, and the
+  original allocations are freed;
+- in a prefill they arrive with their layer like any lent weight; in decode
+  they are empty tensors, and the model widens its int8 copy for the rare
+  decode-phase call the int8 kernel cannot take.
+
+Where the room goes matters. The KV pool stays resident through a prefill, the
+lent weights do not; so the freed decode memory must go to lent weights (more
+hot experts), not to a larger pool, or the prefill loses exactly what decode
+gained. Flash-Next (GGUF, one MTP draft step, two 16 GB cards, Japanese-fiction
+decode, 35K-token streamed prefill at chunk 16384):
+
+| | KV pool | prefill window free / peak | 35K prefill + 200 | decode, mean of 8 |
+|---|---|---|---|---|
+| no reverse lend, 64 hot experts | 121,152 | 6,655 / 6,634 MiB | 11.5 s | 83.3 tok/s |
+| reverse lend, 64 hot (pool grows) | 131,072 | 6,121 MiB: out of memory | — | — |
+| reverse lend, 84 hot, pool held | 121,152 | 6,225 / 6,126 MiB | 11.6 s | 86.2-87.2 tok/s |
 
 ## How it is wired
 
