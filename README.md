@@ -304,16 +304,39 @@ compute the same thing — are read only by the prefill. With
   decode-phase call the int8 kernel cannot take.
 
 Where the room goes matters. The KV pool stays resident through a prefill, the
-lent weights do not; so the freed decode memory must go to lent weights (more
-hot experts), not to a larger pool, or the prefill loses exactly what decode
-gained. Flash-Next (GGUF, one MTP draft step, two 16 GB cards, Japanese-fiction
-decode, 35K-token streamed prefill at chunk 16384):
+lent weights do not; so freed decode memory is better given to lent weights
+(more hot experts) than to a larger pool, which keeps that room out of every
+prefill. When this section was written (10-10) the 64-hot row with the pool
+grown to 131,072 tokens ran out of memory in the 35K prefill (6,121 MiB free
+in the prefill window); in the re-measurement below, with a lighter MTP draft
+and memory freed elsewhere in the serving tree since, it fits, and its decode
+stays where the 64-hot row is. Flash-Next (GGUF, one MTP draft step, two 16 GB
+cards, Japanese-fiction decode, 35K-token streamed prefill at chunk 16384):
+
+**Correction (2026-10-12).** The decode figures first published in this table
+(83.3 and 86.2-87.2 tok/s) were measured with a bug in the serving tree's
+dynamic hot-expert cache (not part of this repository): the CPU side skipped
+every expert whose id was below the number of GPU slots, also when the cache
+did not hold it, so those routes were computed by nobody. Decode was faster
+than the model allows. The table is re-measured with the fix: same prompts,
+35K brief and settings as on 10-10, except the MTP draft, now the GGUF
+release's own draft head (Q2_0 experts) instead of a draft from another
+checkpoint, so the serve comes from one GGUF. The serving tree has also gained
+decode work since 10-10, so the new figures are not the old ones minus the
+bug; the rows are comparable with each other (two launches each, interleaved).
 
 | | KV pool | prefill window free / peak | 35K prefill + 200 | decode, mean of 8 |
 |---|---|---|---|---|
-| no reverse lend, 64 hot experts | 121,152 | 6,655 / 6,634 MiB | 11.5 s | 83.3 tok/s |
-| reverse lend, 64 hot (pool grows) | 131,072 | 6,121 MiB: out of memory | — | — |
-| reverse lend, 84 hot, pool held | 121,152 | 6,225 / 6,126 MiB | 11.6 s | 86.2-87.2 tok/s |
+| no reverse lend, 64 hot experts | 121,152 | 8.90 / 6.83 GB | 11.3-11.4 s | 104.6-106.2 tok/s |
+| reverse lend, 64 hot (pool grows) | 131,072 | 8.41 / 6.85 GB (10-10: out of memory) | 11.2 s | 104.8 tok/s (one launch) |
+| reverse lend, 84 hot, pool held | 121,152 | 8.57 / 6.85 GB | 11.3-11.5 s | 107.0-109.5 tok/s |
+| the same + hot experts in the KV pool's free pages ⁵ | 121,152 | 8.57 / 6.85 GB | 11.4 s | 110.8-111.9 tok/s |
+
+⁵ A feature of the serving tree, not of this repository: hot-expert slots
+placed in the KV pages the allocator has free, counted as free and given back
+whenever the KV needs them (before every streamed prefill, and to any
+allocation that would otherwise wait), so the pool and the prefill window are
+unchanged; here 18-19 more slots per layer after the 35K.
 
 ## How it is wired
 
