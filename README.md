@@ -338,6 +338,95 @@ whenever the KV needs them (before every streamed prefill, and to any
 allocation that would otherwise wait), so the pool and the prefill window are
 unchanged; here 18-19 more slots per layer after the 35K.
 
+## Hot experts, and the KV pool's free pages
+
+Two more pieces of the same serving tree, in `hot/`, for a KTransformers hybrid
+whose experts come from a GGUF (`--kt-method LLAMAFILE` with a GGUF weight
+path): a hot-expert cache on the GPU that follows the decode's routing, and a
+lend of the KV pool's *free* pages to more hot experts.
+
+**The cache** (`kt_hot_cache.py`, `KT_HOT_DYNAMIC=1`). The KT wrapper keeps
+`--kt-num-gpu-experts` experts per layer on the GPU as raw GGUF blocks
+(`kt_gguf_hot.py`, a window kernel that reads each expert once for the 2-4
+tokens of a decode / MTP verify step, `kt_gguf_moe_multi.cu`). Which experts
+sit there is decided from decayed route counts, a few swaps per layer every
+`KT_HOT_INTERVAL` steps, copied from pinned host banks of the GGUF; the decode
+graph only reads two tables (logical id -> slot, logical id -> CPU id), so the
+captured graphs never change. The CPU computes exactly the routes the tables
+give it (`sglang-kt-hot-cpu-mask.py` removes kt-kernel's static prefix mask),
+so no route is computed twice or dropped.
+
+**The KV lend** (`kt_hot_kv_lend.py`, `KT_HOT_KV_LEND=1`). An empty KV pool
+is VRAM doing nothing. Its free pages, in groups, hold more expert slots:
+lent pages still count as free to the allocator, are taken back *inside* the
+allocation before any kernel runs, zeroed, and the slots they held disappear
+from the tables; a streamed prefill returns everything first. The hot kernels
+address every slot through per-layer pointer tables (fixed addresses, so the
+graphs stay valid). The pool is never made smaller: with the lend on, the KV
+pool is the same number of tokens as without it.
+
+Flash-Next, Strata's IQ3_S GGUF (the file `Strata` serves), one-step MTP with
+its Q2_0 draft:
+
+| | hot experts per layer | decode (Japanese fiction, 1,024 tokens) | KV pool |
+|---|---|---|---|
+| two cards, dynamic cache, int8 hc mix | 168 | **119.9 tok/s** | 121,152 |
+| two cards, identical weights to Strata (bf16 mix) | 168 | 107.0 | 121,152 |
+| Strata 0.1.42 on the same two cards | | 97.2 | |
+| one card + one socket, 56 fixed | 56 | 81.5-82.0 | 65,536 |
+| one card + one socket, 56 fixed + the KV lend | 56 + 14-18 lent | **83.8-84.6** | 65,536 |
+
+Paired NLL (the same 480- and 1,024-token pieces scored under each setting) is
+within launch noise for the cache and identical token by token for the lend;
+the cache's correctness is checked against an exact reference
+(`KT_HOT_KV_LEND_CHECK=1` compares every lent slot with its bank before it is
+zeroed). Two cards gain nothing from the lend (the pool's pages are the only
+free VRAM at one card, not at two), so it is on for one card and off for two
+in our launcher.
+
+Applying it, after the lend (each script takes the SGLang tree as its argument;
+the modules are copied from `hot/` into `python/sglang/srt/layers/moe/`):
+
+```
+python hot/sglang-kt-gguf-hot.py   <sglang tree>   # the GPU hot-expert method for GGUF experts
+python hot/sglang-kt-hot-cache.py  <sglang tree>   # the cache and its tables, KT_HOT_DYNAMIC=1
+python hot/sglang-kt-hot-cpu-mask.py <sglang tree> # the CPU takes the ids the cache gives it
+python hot/sglang-kt-hot-kv-lend.py <sglang tree>  # the KV-page lend, KT_HOT_KV_LEND=1
+```
+
+The window kernel is built on first use with torch's `load_inline` (its source
+is generated from sgl-kernel's GGUF kernels by `hot/kt-gguf-moe-multi-build.py`;
+Apache-2.0 / MIT, see the file header). The cache copies experts from pinned
+host banks: our tree takes them from its GGUF prefill streamer, which is not
+in this repo; without it the cache pins its own (`KT_HOT_BANKS=own` forces
+this even with the streamer), which costs the experts' size in pinned RAM,
+about 80 s more on every launch (the banks are pinned layer by layer at the
+first fill; later swaps read them), and we measured one KV page group less
+(65,024 instead of 65,536 tokens of pool) at one card.
+
+Knobs: `KT_GPU_EXPERTS` (the launcher's `--kt-num-gpu-experts`),
+`KT_HOT_INTERVAL` (32), `KT_HOT_SWAPS` (8 per layer per round), `KT_HOT_DECAY`
+(0.9), `KT_HOT_KV_LEND_MAX` (64 lent slots per layer at most),
+`KT_HOT_FUSED_ROUTE` / `KT_HOT_FUSED_COMBINE` (one Triton kernel each for the
+table lookups and for the route weighting + sum; identical results), `KT_HOT_LOG`.
+A seed placement (`KT_EXPERT_PLACEMENT`, a JSON of the hottest experts per
+layer from an earlier run) shortens the warm-up; without it the cache starts
+from the loader's static placement and converges within a few hundred steps.
+
+Sizing it: `tools/hostprobe.py` (your GPUs by NUMA node, cores and RAM per
+node, THP / swap / min_free_kbytes), `tools/modelprobe.py <model dir> [--gguf
+DIR]` (experts, their per-slot size, dense bytes, KV bytes per token, from
+the weight headers alone) and `tools/plan-launch.py <model dir> --tp N
+--context T` (the per-rank VRAM budget spent in order — dense, lm_head, draft,
+the KV pool for the context, linear-attention states, graphs, workspace — and
+the hot experts per layer that remain, minus what the empty pool lends).
+Its constants are the ones measured on our cards and are printed with every
+plan; your first launch log corrects them.
+
+Measured on Flash-Next only. Other GGUF MoE models need their expert tensor
+names (`blk.N.ffn_{gate,up,down}_exps.weight`) and a kernel for their types
+(`kt_gguf_moe_multi.py` lists them).
+
 ## How it is wired
 
 For porting to another tree. Five points, none in a model file:
