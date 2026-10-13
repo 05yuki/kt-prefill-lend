@@ -2,7 +2,7 @@
 
 `sglang-v0.5.19-flash-next-gguf.patch` turns upstream SGLang at
 `release/v0.5.19` (commit `0bcd822`) into the tree this repo's Flash-Next
-numbers were measured on: 175 files, every KT-side module included, no
+numbers were measured on: 176 files, every KT-side module included, no
 per-feature patcher to run afterwards. It is the tree, not a set of options:
 apply it, build, serve.
 
@@ -42,8 +42,9 @@ What is in it, from the bottom up:
 - the QSA Triton kernels cast an fp8 KV cache before their dots
   (`--kv-cache-dtype fp8_e4m3` then works on the extend path; a no-op for bf16).
 
-Not in it: the per-pass speculative-decoding dump (a measurement patch), and
-the launcher. The knobs the launcher sets are listed in the top-level README
+Not in it: the per-pass speculative-decoding dump (a measurement patch; the
+rest of `eagle_worker_v2.py`'s changes, the QSA / MTP wiring, is in), and the
+launcher — `tools/serve.py` is the launcher. The knobs the launcher sets are listed in the top-level README
 (`Knobs`) and in each module's docstring; `tools/plan-launch.py` prints the
 hot-expert count, chunk and thread counts for your card, model and context.
 
@@ -64,6 +65,8 @@ It also needs:
   Triton) — the `requirements` of v0.5.19.
 
 The patch is the serving tree's `git diff 0bcd822` with the measurement patch
-and backup files removed; it reproduces that tree file for file (checked
-on a clean worktree, 2026-10-13). Where a knob's default differs from
+and backup files removed; it reproduces that tree file for file (checked on
+a clean worktree, 2026-10-13), and `tools/install.sh` + `tools/serve.py` on a
+fresh clone served the same decode speed as the serving tree (TP1, 84-91
+tok/s on the 1,024-token Japanese prompts, pool 65,536). Where a knob's default differs from
 upstream, the module docstring says so.
