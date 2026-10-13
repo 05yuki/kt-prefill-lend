@@ -125,7 +125,12 @@ def main():
         plan_cmd += ["--draft-bytes", "0"]
     plan = json.loads(sh(plan_cmd))
     kv_lend = prof.get("env_by_tp", {}).get(str(tp), {}).get("KT_HOT_KV_LEND") == "1"
-    hot = a.hot if a.hot is not None else (plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"])
+    if a.hot is not None:
+        hot = a.hot
+    elif "hot" in d:
+        hot = d["hot"]  # the profile's measured value; the plan is printed beside it
+    else:
+        hot = plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"]
     chunk = a.chunk or plan["chunk"]
     threads = a.threads or plan["threads"]
     key = f"tp{tp}-ctx{context}-mamba{mamba_slots}-{os.path.basename(experts_dir.rstrip('/'))}"
@@ -190,6 +195,7 @@ def main():
         f.write(str(proc.pid))
     if a.background:
         print(f"started pid {proc.pid}")
+        print(f"tail the log for 'max_total_num_tokens=': the pool the server sized against context {context}")
         return 0
     try:
         while proc.poll() is None:

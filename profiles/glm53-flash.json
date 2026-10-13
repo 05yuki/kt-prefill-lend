@@ -15,7 +15,9 @@
       "mem_fraction": 0.82,
       "kv_dtype": "fp8",
       "mamba_slots": 8,
-      "pools": 2
+      "pools": 2,
+      "hot": 10,
+      "note": "hot 10 measured (pool 85,248 at 131K context, fp8 KV); the plan's 11 left 34,880: GLM's fixed VRAM (DSA indexer pool, full-GPU prefill workspace) is ~0.5 GiB above the planner's Flash-Next constants"
     }
   },
   "command": [

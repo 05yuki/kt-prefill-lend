@@ -37,3 +37,9 @@ Both reproduce the serving trees file for file on clean worktrees
 (2026-10-13). The serve: `tools/serve.py --profile glm53-flash --venv ... --tree
 ... --config-dir <fp8 dense checkpoint> --experts <nvfp4 checkpoint> --tp 2
 [--placement <frequency placement .pt>]`.
+
+Checked 2026-10-13 through `serve.py`: fired up, 19.4-19.5 tok/s on the
+Japanese prompts (the launcher's 18.6). The profile pins hot 10: the plan's
+11 left a 34,880-token pool against 85,248 at 10 — GLM's fixed VRAM (the DSA
+indexer's K pool, the full-GPU prefill workspace) is about 0.5 GiB above the
+planner's Flash-Next constants, so for GLM the measured hot wins over the plan.
