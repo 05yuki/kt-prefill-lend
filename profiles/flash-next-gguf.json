@@ -1,0 +1,55 @@
+{
+  "name": "flash-next-gguf",
+  "description": "Qwen3.8-Flash-Next served entirely from a GGUF (Strata's IQ3_S set): LLAMAFILE CPU experts, the GGUF dense loader, both streamer editions, the lend, the hot cache and KV-page lend, one-step MTP from Strata's draft",
+  "tree": "sglang-v0.5.19 + trees/flash-next-gguf",
+  "weights": {"gguf": true, "experts_from": false, "embed_host": 1, "draft": "dir", "draft_bytes_assumed": 0.84},
+  "defaults": {
+    "1": {"context": 65536, "mem_fraction": 0.93, "kv_dtype": "bf16", "mamba_slots": 8, "pools": 1},
+    "2": {"context": 131072, "mem_fraction": 0.955, "kv_dtype": "bf16", "mamba_slots": 8, "pools": 2}
+  },
+  "command": [
+    "-m", "sglang.launch_server",
+    "--model-path", "{config_dir}", "--served-model-name", "{served_model_name}",
+    "--model-impl", "sglang", "--load-format", "safetensors", "--dtype", "bfloat16",
+    "--host", "0.0.0.0", "--port", "{port}", "--tp", "{tp}", "--numa-node", "{numa_nodes}",
+    "--disable-custom-all-reduce", "--language-model-only",
+    "--prefill-attention-backend", "triton", "--decode-attention-backend", "trtllm_mha",
+    "--linear-attn-prefill-backend", "flashinfer", "--linear-attn-decode-backend", "flashinfer",
+    "--fp4-gemm-backend", "flashinfer_cutlass", "--moe-runner-backend", "flashinfer_cutlass",
+    "--ple-offload-embedding", "--mamba-ssm-dtype", "bfloat16", "--kv-cache-dtype", "{kv_cache_dtype}",
+    "--mamba-radix-cache-strategy", "extra_buffer", "--max-mamba-cache-size", "{mamba_slots}",
+    "--kt-weight-path", "{experts_dir}", "--kt-method", "LLAMAFILE", "--kt-num-gpu-experts", "{hot}",
+    "--kt-cpuinfer", "{threads}", "--kt-threadpool-count", "{pools}", "--kt-max-deferred-experts-per-token", "0",
+    "--context-length", "{context}", "--max-total-tokens", "{context}", "--page-size", "64",
+    "--chunked-prefill-size", "{chunk}", "--max-prefill-tokens", "{chunk}",
+    "--max-running-requests", "1", "--cuda-graph-max-bs-decode", "1", "--mem-fraction-static", "{mem_fraction}",
+    "--disable-flashinfer-autotune", "--sampling-backend", "pytorch", "--reasoning-parser", "qwen3",
+    "--watchdog-timeout", "1800", "--warmups", "kt_extend"
+  ],
+  "command_with_draft": [
+    "--speculative-draft-model-path", "{draft_dir}", "--speculative-algorithm", "NEXTN",
+    "--speculative-num-steps", "1", "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "2"
+  ],
+  "command_with_placement": ["--init-expert-location", "{placement}"],
+  "env": {
+    "NCCL_P2P_DISABLE": "1", "NCCL_IB_DISABLE": "1", "SGLANG_NUMA_BIND_V2": "True",
+    "KT_GGUF_DENSE": "{experts_dir}", "KT_GGUF_DENSE_MODEL_PATH": "{config_dir}", "KT_GGUF_DENSE_QUANT": "1",
+    "KT_GGUF_FAST_HEADER": "1", "KT_FAST_PINNED": "1", "KT_GGUF_NOCOPY": "1", "KT_GGUF_DENSE_THREADS": "8",
+    "KT_GGUF_PREFETCH": "8", "KT_EMBED_HOST": "1",
+    "KT_GGUF_DENSE_CACHE": "{cache_dir}/dense", "KT_CUTEDSL_CACHE": "{cache_dir}/cutedsl",
+    "KT_GPU_STREAM_PREFILL": "256", "KT_GPU_STREAM_GROUP": "64", "KT_GPU_STREAM_EARLY_INIT": "1",
+    "KT_STREAM_MEMOPS": "1", "KT_PREFILL_LEND": "1", "KT_PREFILL_LEND_CALIBRATE": "0",
+    "KT_PREFILL_LEND_HINT": "{cache_dir}/lend-hint-{key}",
+    "KT_GPU_EXPERTS": "{hot}", "KT_EXPERT_PLACEMENT": "none", "KT_HOT_DYNAMIC": "{hot_dynamic}",
+    "KT_HOT_INTERVAL": "64", "KT_HOT_SWAPS": "4", "KT_LLAMAFILE_GROUP_MIN_LEN": "2",
+    "KT_TASKQUEUE_SPIN_US": "200", "KT_EXPERT_SHM": "0", "SGLANG_HOST_STAGED_ALLREDUCE": "1",
+    "KT_GPU_STREAM_DROP_CACHE": "{config_dir}"
+  },
+  "env_by_tp": {
+    "1": {"KT_HOT_KV_LEND": "1", "KT_HC_FP8": "0", "KT_HC_FP8_ALL": "0", "SGLANG_LL_ALLREDUCE": "0"},
+    "2": {"KT_HOT_KV_LEND": "0", "KT_HC_FP8": "int8", "KT_HC_FP8_ALL": "1", "KT_PREFILL_LEND_PFONLY": "input_mix_weight", "SGLANG_LL_ALLREDUCE": "1"}
+  },
+  "env_with_draft": {"KT_MTP_GGUF": "{draft_gguf}", "KT_NEXT_MTP_GPU_ONLY": "1", "KT_MTP_Q2_0": "1"},
+  "env_with_draft_hot": {"KT_DRAFT_HOT": "{draft_hot}"},
+  "env_with_hot_seed": {"KT_HOT_SEED": "{hot_seed}"}
+}

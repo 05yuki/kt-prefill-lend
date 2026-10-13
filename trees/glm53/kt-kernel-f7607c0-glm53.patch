@@ -1,0 +1,606 @@
+diff --git a/kt-kernel/cpu_backend/cpuinfer.h b/kt-kernel/cpu_backend/cpuinfer.h
+index 227187d..1fe919a 100644
+--- a/kt-kernel/cpu_backend/cpuinfer.h
++++ b/kt-kernel/cpu_backend/cpuinfer.h
+@@ -10,8 +10,13 @@
+ #ifndef CPUINFER_CPUINFER_H
+ #define CPUINFER_CPUINFER_H
+ 
++#include <dlfcn.h>
++
+ #include <atomic>
+ #include <condition_variable>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
+ #include <functional>
+ #include <mutex>
+ #include <queue>
+@@ -41,6 +46,7 @@ class CPUInfer {
+     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+     backend_ = new WorkerPool(thread_num);
+     task_queue_ = new TaskQueue();
++    memops_init();
+     for (int i = 0; i < (1 << 16); ++i) {
+       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
+     }
+@@ -49,6 +55,7 @@ class CPUInfer {
+     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+     backend_ = new WorkerPool(thread_num, numa_id);
+     task_queue_ = new TaskQueue();
++    memops_init();
+     for (int i = 0; i < (1 << 16); ++i) {
+       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
+     }
+@@ -58,6 +65,7 @@ class CPUInfer {
+     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+     backend_ = new WorkerPool(config);
+     task_queue_ = new TaskQueue();
++    memops_init();
+     for (int i = 0; i < (1 << 16); ++i) {
+       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
+     }
+@@ -65,6 +73,10 @@ class CPUInfer {
+ 
+   ~CPUInfer() {
+     printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
++    if (mpoller_.joinable()) {
++      mstop_.store(true);
++      mpoller_.join();
++    }
+     delete backend_;
+     delete task_queue_;
+   }
+@@ -93,6 +105,11 @@ class CPUInfer {
+     void (*func)(void*) = (void (*)(void*))params.first;
+     void* args = (void*)params.second;
+     *((CPUInfer**)args) = this;
++    if (mflags_ != nullptr) {
++      const int idx = memop_arm((cudaStream_t)user_cuda_stream, func, args, false, 0);
++      write32_((void*)user_cuda_stream, req_dev(idx), 1, 0);
++      return;
++    }
+     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
+ #endif
+   }
+@@ -117,6 +134,13 @@ class CPUInfer {
+ #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
+     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
+     defined(KTRANSFORMERS_USE_ASCEND_NPU)
++    if (mflags_ != nullptr) {
++      const int idx = memop_arm((cudaStream_t)user_cuda_stream, nullptr, nullptr, true, allow_n_pending);
++      write32_((void*)user_cuda_stream, req_dev(idx), 1, 0);
++      wait32_((void*)user_cuda_stream, done_dev(idx), 1, 0x1 /* CU_STREAM_WAIT_VALUE_EQ */);
++      write32_((void*)user_cuda_stream, done_dev(idx), 0, 0);
++      return;
++    }
+     SyncArgs* args = new SyncArgs{this, allow_n_pending};
+     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+ #endif
+@@ -125,6 +149,121 @@ class CPUInfer {
+  public:
+   WorkerPool* backend_;
+   TaskQueue* task_queue_;
++
++ private:
++  // ---- KT_STREAM_MEMOPS (native-ubuntu/patches/kt-stream-memops.py) ----
++  struct MemopEntry {
++    void (*func)(void*);
++    void* args;
++    size_t allow;
++    int idx;
++    bool sync;
++    bool permanent;
++  };
++  typedef int (*StreamValueFn)(void*, unsigned long long, unsigned int, unsigned int);
++  static constexpr int kRing = 4096, kPerm = 4096, kStride = 16;  // 16 x u32 = one cache line
++  StreamValueFn write32_ = nullptr, wait32_ = nullptr;
++  volatile uint32_t* mflags_ = nullptr;
++  uint32_t* mflags_dev_ = nullptr;
++  std::atomic<int> ring_next_{0}, perm_next_{0};
++  std::mutex mmtx_;
++  std::vector<MemopEntry> mentries_;
++  std::atomic<uint64_t> mversion_{0};
++  std::thread mpoller_;
++  std::atomic<bool> mstop_{false};
++
++  volatile uint32_t* req_host(int i) { return mflags_ + (size_t)i * 2 * kStride; }
++  volatile uint32_t* done_host(int i) { return mflags_ + (size_t)i * 2 * kStride + kStride; }
++  unsigned long long req_dev(int i) { return (unsigned long long)(mflags_dev_ + (size_t)i * 2 * kStride); }
++  unsigned long long done_dev(int i) {
++    return (unsigned long long)(mflags_dev_ + (size_t)i * 2 * kStride + kStride);
++  }
++
++  void memops_init() {
++#if defined(KTRANSFORMERS_USE_CUDA)
++    const char* on = getenv("KT_STREAM_MEMOPS");
++    if (on == nullptr || on[0] != '1') return;
++    void* h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
++    if (h != nullptr) {
++      write32_ = (StreamValueFn)dlsym(h, "cuStreamWriteValue32_v2");
++      wait32_ = (StreamValueFn)dlsym(h, "cuStreamWaitValue32_v2");
++    }
++    const size_t bytes = (size_t)(kRing + kPerm) * 2 * kStride * sizeof(uint32_t);
++    void* host = nullptr;
++    void* dev = nullptr;
++    if (write32_ == nullptr || wait32_ == nullptr ||
++        cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
++        cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
++      printf("[kt-memops] unavailable, keeping host functions\n");
++      return;
++    }
++    std::memset(host, 0, bytes);
++    mflags_dev_ = (uint32_t*)dev;
++    mflags_ = (volatile uint32_t*)host;
++    mpoller_ = std::thread(&CPUInfer::memop_poller, this);
++    printf("[kt-memops] CPUInfer[0x%lx]: stream memops on, %d ring + %d graph slots\n", (intptr_t)this, kRing,
++           kPerm);
++#endif
++  }
++
++  int memop_arm(cudaStream_t st, void (*func)(void*), void* args, bool sync, size_t allow) {
++    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
++    cudaStreamIsCapturing(st, &cs);
++    const bool perm = cs == cudaStreamCaptureStatusActive;
++    int idx;
++    if (perm) {
++      const int n = perm_next_.fetch_add(1);
++      if (n >= kPerm) throw std::runtime_error("KT_STREAM_MEMOPS: out of graph slots");
++      idx = kRing + n;
++    } else {
++      idx = ring_next_.fetch_add(1) % kRing;
++    }
++    std::lock_guard<std::mutex> g(mmtx_);
++    mentries_.push_back(MemopEntry{func, args, allow, idx, sync, perm});
++    mversion_.fetch_add(1, std::memory_order_release);
++    return idx;
++  }
++
++  void memop_poller() {
++    std::vector<MemopEntry> snap;
++    uint64_t seen = ~0ull;
++    while (!mstop_.load(std::memory_order_relaxed)) {
++      const uint64_t v = mversion_.load(std::memory_order_acquire);
++      if (v != seen) {
++        std::lock_guard<std::mutex> g(mmtx_);
++        snap = mentries_;
++        seen = mversion_.load(std::memory_order_acquire);
++      }
++      std::vector<int> retire;
++      // Arming order is stream order, so within one scan a submit is handled
++      // before the sync that follows it.
++      for (const MemopEntry& e : snap) {
++        if (*req_host(e.idx) != 1) continue;
++        *req_host(e.idx) = 0;
++        if (!e.sync) {
++          e.func(e.args);
++        } else {
++          task_queue_->sync(e.allow);
++          std::atomic_thread_fence(std::memory_order_release);
++          *done_host(e.idx) = 1;
++        }
++        if (!e.permanent) retire.push_back(e.idx);
++      }
++      __builtin_ia32_pause();
++      if (!retire.empty()) {
++        std::lock_guard<std::mutex> g(mmtx_);
++        for (int idx : retire) {
++          for (size_t i = 0; i < mentries_.size(); i++) {
++            if (!mentries_[i].permanent && mentries_[i].idx == idx) {
++              mentries_.erase(mentries_.begin() + i);
++              break;
++            }
++          }
++        }
++        mversion_.fetch_add(1, std::memory_order_release);
++      }
++    }
++  }
+ };
+ 
+ #endif
+diff --git a/kt-kernel/cpu_backend/task_queue.cpp b/kt-kernel/cpu_backend/task_queue.cpp
+index b38f360..c25b4a9 100644
+--- a/kt-kernel/cpu_backend/task_queue.cpp
++++ b/kt-kernel/cpu_backend/task_queue.cpp
+@@ -13,10 +13,12 @@
+ #include <sched.h>
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <iostream>
+ #include <thread>
+ 
+ TaskQueue::TaskQueue() : done(false), pending(0) {
++  if (const char* e = std::getenv("KT_TASKQUEUE_SPIN_US")) spin_us = std::atoi(e);
+   Node* dummy = new Node();
+   head.store(dummy, std::memory_order_relaxed);
+   tail.store(dummy, std::memory_order_relaxed);
+@@ -52,6 +54,11 @@ void TaskQueue::enqueue(std::function<void()> task) {
+ 
+ void TaskQueue::sync(size_t allow_n_pending) {
+   std::exception_ptr task_exception;
++  if (spin_us > 0) {
++    const uint64_t until = spin_now_ns() + uint64_t(spin_us) * 1000;
++    while (pending.load(std::memory_order_acquire) > allow_n_pending && spin_now_ns() < until) {
++    }
++  }
+   {
+     std::unique_lock<std::mutex> lock(mtx);
+     cv.wait(lock, [&] {
+@@ -89,6 +96,13 @@ void TaskQueue::worker() {
+       }
+       cv.notify_all();
+     } else {
++      if (spin_us > 0) {
++        const uint64_t until = spin_now_ns() + uint64_t(spin_us) * 1000;
++        while (curr->next.load(std::memory_order_acquire) == nullptr &&
++               !done.load(std::memory_order_acquire) && spin_now_ns() < until) {
++        }
++        if (curr->next.load(std::memory_order_acquire) != nullptr) continue;
++      }
+       std::unique_lock<std::mutex> lock(mtx);
+       cv.wait(lock, [&] {
+         return curr->next.load(std::memory_order_acquire) != nullptr
+diff --git a/kt-kernel/cpu_backend/task_queue.h b/kt-kernel/cpu_backend/task_queue.h
+index cbcd2e6..4979595 100644
+--- a/kt-kernel/cpu_backend/task_queue.h
++++ b/kt-kernel/cpu_backend/task_queue.h
+@@ -18,6 +18,8 @@
+ #include <queue>
+ #include <thread>
+ #include <vector>
++#include <chrono>
++#include <cstdint>
+ 
+ class TaskQueue {
+  public:
+@@ -44,6 +46,12 @@ class TaskQueue {
+   std::mutex mtx;
+   std::condition_variable cv;
+   std::exception_ptr first_exception;
++  // KT_TASKQUEUE_SPIN_US: spin this long before a condition-variable wait.
++  int spin_us = 0;
++  static uint64_t spin_now_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
+ 
+   void worker();
+ };
+diff --git a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+index 5dbee47..ab7fac1 100644
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+@@ -1,3 +1,20 @@
++#include <cstdlib>
++
++// KT_LOAD_ALL_EXPERTS=1: also load the GPU-assigned experts, so the host can hand
++// their NVFP4 bytes to GPU-resident hot slots (write_weight_scale_to_buffer).
++// Compute still skips them.
++// KT_MXFP4_SCALE_CODES=1: group-16 decode reads a one-byte scale index per
++// group plus a per-matrix 256-entry FP32 table (patches/kt-mxfp4-scale-codes.py).
++// Read at every load, so one process can load both ways.
++static inline bool kt_mxfp4_scale_codes() {
++  const char* e = std::getenv("KT_MXFP4_SCALE_CODES");
++  return e && e[0] == '1';
++}
++
++static inline bool kt_load_all_experts() {
++  static const bool v = [] { const char* e = std::getenv("KT_LOAD_ALL_EXPERTS"); return e && e[0] == '1'; }();
++  return v;
++}
+ /**
+  * @Description  : AVX2 MXFP4 MoE operator for DeepSeek V4 native inference
+  * SPDX-License-Identifier: Apache-2.0
+@@ -16,6 +33,8 @@
+ #include <tmmintrin.h>
+ 
+ #include <algorithm>
++#include <atomic>
++#include <memory>
+ #include <cstring>
+ #include <stdexcept>
+ #include <string>
+@@ -189,6 +208,43 @@ struct GemmKernelAVX2MXFP4 {
+       return n * (k / k_group_size) * sizeof(float);
+     }
+ 
++    // One-byte scale codes (KT_MXFP4_SCALE_CODES). lut holds this matrix's
++    // distinct FP32 scales bit for bit; code[i] indexes it for group i.
++    std::unique_ptr<uint8_t[]> code_store;
++    uint8_t* code = nullptr;
++    alignas(64) float lut[256];
++
++    // Returns false (and leaves the FP32 path in place) if the matrix has more
++    // than 256 distinct scale bit patterns.
++    bool build_scale_codes() {
++      code = nullptr;
++      if (d == nullptr || n <= 0 || k_group_count <= 0) return false;
++      const size_t cnt = (size_t)n * k_group_count;
++      std::unique_ptr<uint8_t[]> out(new uint8_t[cnt]);
++      uint32_t keys[512];
++      int16_t val[512];
++      for (int i = 0; i < 512; i++) val[i] = -1;
++      int nd = 0;
++      for (size_t i = 0; i < cnt; i++) {
++        uint32_t x;
++        std::memcpy(&x, d + i, 4);
++        uint32_t h = (x * 2654435761u) >> 23;
++        while (val[h] >= 0 && keys[h] != x) h = (h + 1) & 511;
++        if (val[h] < 0) {
++          if (nd == 256) return false;
++          keys[h] = x;
++          val[h] = (int16_t)nd;
++          std::memcpy(&lut[nd], &x, 4);
++          nd++;
++        }
++        out[i] = (uint8_t)val[h];
++      }
++      for (int i = nd; i < 256; i++) lut[i] = 0.0f;
++      code_store = std::move(out);
++      code = code_store.get();
++      return true;
++    }
++
+     void from_raw_mat(const uint8_t* proj, int ith, int nth) {
+       if (b == nullptr) return;
+       auto [n_start, n_end] = split_range(n, ith, nth);
+@@ -427,64 +483,69 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
+   const __m256 w2 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16b));       \
+   const __m256 w3 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16b))
+ 
+-    for (int ni = n_start; ni < n_end; ni++) {
+-      const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
+-      const float* b_scales = b.d + (size_t)ni * group_count;
+-      if (ni + 1 < n_end) {
+-        const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
+-        _mm_prefetch(nr, _MM_HINT_T0);
+-        _mm_prefetch(nr + 64, _MM_HINT_T0);
+-        _mm_prefetch(nr + 128, _MM_HINT_T0);
+-        _mm_prefetch(nr + 192, _MM_HINT_T0);
+-      }
+-
+-      // 4-token blocked path: per block, each half folds with its own scale.
+-      int mi = 0;
+-      for (; mi + 4 <= m; mi += 4) {
+-        const float* p0 = a_perm + (size_t)(mi + 0) * k;
+-        const float* p1 = a_perm + (size_t)(mi + 1) * k;
+-        const float* p2 = a_perm + (size_t)(mi + 2) * k;
+-        const float* p3 = a_perm + (size_t)(mi + 3) * k;
+-        __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
+-        __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
+-
+-        for (int blk = 0; blk < block_count; blk++) {
+-          const int base = blk * 32;
+-          KT_MXFP4_DECODE_GROUP(b_row, blk);
+-          const __m256 sa = _mm256_broadcast_ss(&b_scales[2 * blk]);
+-          const __m256 sb = _mm256_broadcast_ss(&b_scales[2 * blk + 1]);
+-
+-          __m256 h0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0);
+-          __m256 h1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0);
+-          __m256 h2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0);
+-          __m256 h3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0);
+-          h0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1, h0);
+-          h1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1, h1);
+-          h2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1, h2);
+-          h3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1, h3);
+-          tot0 = _mm256_fmadd_ps(h0, sa, tot0);
+-          tot1 = _mm256_fmadd_ps(h1, sa, tot1);
+-          tot2 = _mm256_fmadd_ps(h2, sa, tot2);
+-          tot3 = _mm256_fmadd_ps(h3, sa, tot3);
+-
+-          h0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base + 16), w2);
+-          h1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base + 16), w2);
+-          h2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base + 16), w2);
+-          h3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base + 16), w2);
+-          h0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3, h0);
+-          h1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3, h1);
+-          h2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3, h2);
+-          h3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3, h3);
+-          tot0 = _mm256_fmadd_ps(h0, sb, tot0);
+-          tot1 = _mm256_fmadd_ps(h1, sb, tot1);
+-          tot2 = _mm256_fmadd_ps(h2, sb, tot2);
+-          tot3 = _mm256_fmadd_ps(h3, sb, tot3);
++    // Rows outer, output columns inner. The four activation rows (64 KiB
++    // at k = 4096) then stay in L1 across every output column instead of being
++    // re-streamed once per column; the weights stream instead and are an
++    // eighth the size, and the stores become contiguous. Each output element
++    // keeps its own untouched k loop and is written exactly once, so the
++    // result is bit-identical.
++    int mi = 0;
++    for (; mi + 4 <= m; mi += 4) {
++      const float* p0 = a_perm + (size_t)(mi + 0) * k;
++      const float* p1 = a_perm + (size_t)(mi + 1) * k;
++      const float* p2 = a_perm + (size_t)(mi + 2) * k;
++      const float* p3 = a_perm + (size_t)(mi + 3) * k;
++      for (int ni = n_start; ni < n_end; ni++) {
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        const float* b_scales = b.d + (size_t)ni * group_count;
++        const uint8_t* b_codes = b.code ? b.code + (size_t)ni * group_count : nullptr;
++        if (ni + 1 < n_end) {
++          const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
++          _mm_prefetch(nr, _MM_HINT_T0);
++          _mm_prefetch(nr + 64, _MM_HINT_T0);
++          _mm_prefetch(nr + 128, _MM_HINT_T0);
++          _mm_prefetch(nr + 192, _MM_HINT_T0);
+         }
+-        c.data[(size_t)(mi + 0) * n + ni] = hsum_avx2(tot0);
+-        c.data[(size_t)(mi + 1) * n + ni] = hsum_avx2(tot1);
+-        c.data[(size_t)(mi + 2) * n + ni] = hsum_avx2(tot2);
+-        c.data[(size_t)(mi + 3) * n + ni] = hsum_avx2(tot3);
+-      }
++          __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
++          __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
++
++          for (int blk = 0; blk < block_count; blk++) {
++            const int base = blk * 32;
++            KT_MXFP4_DECODE_GROUP(b_row, blk);
++            const __m256 sa = _mm256_broadcast_ss(b_codes ? &b.lut[b_codes[2 * blk]] : &b_scales[2 * blk]);
++            const __m256 sb = _mm256_broadcast_ss(b_codes ? &b.lut[b_codes[2 * blk + 1]] : &b_scales[2 * blk + 1]);
++
++            __m256 h0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0);
++            __m256 h1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0);
++            __m256 h2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0);
++            __m256 h3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0);
++            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1, h0);
++            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1, h1);
++            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1, h2);
++            h3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1, h3);
++            tot0 = _mm256_fmadd_ps(h0, sa, tot0);
++            tot1 = _mm256_fmadd_ps(h1, sa, tot1);
++            tot2 = _mm256_fmadd_ps(h2, sa, tot2);
++            tot3 = _mm256_fmadd_ps(h3, sa, tot3);
++
++            h0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base + 16), w2);
++            h1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base + 16), w2);
++            h2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base + 16), w2);
++            h3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base + 16), w2);
++            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3, h0);
++            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3, h1);
++            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3, h2);
++            h3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3, h3);
++            tot0 = _mm256_fmadd_ps(h0, sb, tot0);
++            tot1 = _mm256_fmadd_ps(h1, sb, tot1);
++            tot2 = _mm256_fmadd_ps(h2, sb, tot2);
++            tot3 = _mm256_fmadd_ps(h3, sb, tot3);
++          }
++          c.data[(size_t)(mi + 0) * n + ni] = hsum_avx2(tot0);
++          c.data[(size_t)(mi + 1) * n + ni] = hsum_avx2(tot1);
++          c.data[(size_t)(mi + 2) * n + ni] = hsum_avx2(tot2);
++          c.data[(size_t)(mi + 3) * n + ni] = hsum_avx2(tot3);      }
++    }
+ 
+       // Single-row remainder (also the whole decode path when m == 1).  The two
+       // half-scales per block go to their own accumulators; group-16 folds a
+@@ -493,24 +554,50 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
+       // path's floor -- roughly 1.4x the group-32 single-row cost.  It is a
+       // property of the format's scale density, not the accumulator count: a
+       // four-way split by block parity was measured and made no difference.
+-      for (; mi < m; mi++) {
+-        const float* ap_row = a_perm + (size_t)mi * k;
+-        __m256 total0 = _mm256_setzero_ps();
+-        __m256 total1 = _mm256_setzero_ps();
+-        for (int blk = 0; blk < block_count; blk++) {
+-          const float* ap = ap_row + blk * 32;
+-          KT_MXFP4_DECODE_GROUP(b_row, blk);
+-
+-          __m256 ha = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
+-          ha = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, ha);
+-          __m256 hb = _mm256_mul_ps(_mm256_loadu_ps(ap + 16), w2);
+-          hb = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, hb);
+-
+-          total0 = _mm256_fmadd_ps(ha, _mm256_broadcast_ss(&b_scales[2 * blk]), total0);
+-          total1 = _mm256_fmadd_ps(hb, _mm256_broadcast_ss(&b_scales[2 * blk + 1]), total1);
++    for (; mi < m; mi++) {
++      const float* ap_row = a_perm + (size_t)mi * k;
++      for (int ni = n_start; ni < n_end; ni++) {
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        const float* b_scales = b.d + (size_t)ni * group_count;
++        if (ni + 1 < n_end) {
++          const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
++          _mm_prefetch(nr, _MM_HINT_T0);
++          _mm_prefetch(nr + 64, _MM_HINT_T0);
++          _mm_prefetch(nr + 128, _MM_HINT_T0);
++          _mm_prefetch(nr + 192, _MM_HINT_T0);
+         }
+-        c.data[(size_t)mi * n + ni] = hsum_avx2(_mm256_add_ps(total0, total1));
+-      }
++          __m256 total0 = _mm256_setzero_ps();
++          __m256 total1 = _mm256_setzero_ps();
++          if (b.code != nullptr) {
++            // Same loop; the scale comes from the matrix's table by index.
++            const uint8_t* b_codes = b.code + (size_t)ni * group_count;
++            const float* lut = b.lut;
++            for (int blk = 0; blk < block_count; blk++) {
++              const float* ap = ap_row + blk * 32;
++              KT_MXFP4_DECODE_GROUP(b_row, blk);
++
++              __m256 ha = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++              ha = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, ha);
++              __m256 hb = _mm256_mul_ps(_mm256_loadu_ps(ap + 16), w2);
++              hb = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, hb);
++
++              total0 = _mm256_fmadd_ps(ha, _mm256_broadcast_ss(&lut[b_codes[2 * blk]]), total0);
++              total1 = _mm256_fmadd_ps(hb, _mm256_broadcast_ss(&lut[b_codes[2 * blk + 1]]), total1);
++            }
++          } else
++          for (int blk = 0; blk < block_count; blk++) {
++            const float* ap = ap_row + blk * 32;
++            KT_MXFP4_DECODE_GROUP(b_row, blk);
++
++            __m256 ha = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++            ha = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, ha);
++            __m256 hb = _mm256_mul_ps(_mm256_loadu_ps(ap + 16), w2);
++            hb = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, hb);
++
++            total0 = _mm256_fmadd_ps(ha, _mm256_broadcast_ss(&b_scales[2 * blk]), total0);
++            total1 = _mm256_fmadd_ps(hb, _mm256_broadcast_ss(&b_scales[2 * blk + 1]), total1);
++          }
++          c.data[(size_t)mi * n + ni] = hsum_avx2(_mm256_add_ps(total0, total1));      }
+     }
+ #undef KT_MXFP4_DECODE_GROUP
+     return;
+@@ -777,7 +864,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+           nth_gate * config_.expert_num, nullptr,
+           [this, nth_gate, physical_to_logical_map](int task_id) {
+             uint64_t expert_idx = task_id / nth_gate;
+-            if (config_.should_skip_expert(expert_idx)) return;
++            if (config_.should_skip_expert(expert_idx) && !kt_load_all_experts()) return;
+             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
+             int ith = task_id % nth_gate;
+             size_t weight_offset = ((size_t)lid * config_.intermediate_size * config_.hidden_size) / 2;
+@@ -791,7 +878,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+           nth_down * config_.expert_num, nullptr,
+           [this, nth_down, physical_to_logical_map](int task_id) {
+             uint64_t expert_idx = task_id / nth_down;
+-            if (config_.should_skip_expert(expert_idx)) return;
++            if (config_.should_skip_expert(expert_idx) && !kt_load_all_experts()) return;
+             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
+             int ith = task_id % nth_down;
+             size_t weight_offset = ((size_t)lid * config_.hidden_size * config_.intermediate_size) / 2;
+@@ -803,7 +890,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+           config_.expert_num, nullptr,
+           [this, physical_to_logical_map, group_size](int task_id) {
+             uint64_t expert_idx = task_id;
+-            if (config_.should_skip_expert(expert_idx)) return;
++            if (config_.should_skip_expert(expert_idx) && !kt_load_all_experts()) return;
+             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
+             size_t scale_elem_count = ((size_t)config_.hidden_size * config_.intermediate_size) / group_size;
+             convert_or_copy(gate_bb_[expert_idx]->d, (ggml_bf16_t*)config_.gate_scale + lid * scale_elem_count,
+@@ -998,7 +1085,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+             tpc.expert_num, nullptr,
+             [&, i, per_tp_interm, full_interm, gate_buf, up_buf, down_buf, gate_up_wt_per_expert,
+              down_wt_per_expert](int eid) {
+-              if (tpc.should_skip_expert(eid)) return;
++              if (tpc.should_skip_expert(eid) && !kt_load_all_experts()) return;
+               uint64_t lid = expert_map(physical_to_logical_map, eid);
+ 
+               // H1 & H2: Validate source pointers and lid bounds
+@@ -1137,6 +1224,26 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+       });
+     }
+ 
++    if (kt_mxfp4_scale_codes()) {
++      std::atomic<size_t> built{0}, total{0};
++      pool->dispense_backend()->do_numa_job([&, this](int i) {
++        auto* tp = tps[i].get();
++        auto& tpc = tp->config_;
++        pool->get_subpool(i)->do_work_stealing_job(
++            tpc.expert_num, nullptr,
++            [&, tp](int eid) {
++              if (tpc.should_skip_expert(eid) && !kt_load_all_experts()) return;
++              for (auto* bb : {tp->gate_bb_[eid].get(), tp->up_bb_[eid].get(), tp->down_bb_[eid].get()}) {
++                if (bb == nullptr) continue;
++                total++;
++                if (bb->build_scale_codes()) built++;
++              }
++            },
++            nullptr);
++      });
++      printf("KT_MXFP4_SCALE_CODES: %zu of %zu matrices read one-byte scale codes\n", built.load(), total.load());
++    }
++
+     this->weights_loaded = true;
+   }
+ 
