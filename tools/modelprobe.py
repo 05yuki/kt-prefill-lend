@@ -114,12 +114,19 @@ def classify_hf(name, num_layers, mtp_layers=0):
     m = name
     if any(k in m for k in ("visual", "vision", "image_", "audio")):
         return "vision", None, m
+    if ".ple" in m or ".per_layer" in m:
+        return "ple", None, m  # the per-layer token table (Flash-Next), host memory in the serve
+    if m.startswith("mtp.") or ".mtp." in m:
+        return "draft", None, m
     if ".layers." in m:
         l = int(m.split(".layers.")[1].split(".")[0])
         if l >= num_layers:
             return ("draft" if l < num_layers + max(1, mtp_layers) else "other"), l, m
         if ".experts." in m and "shared" not in m:
-            return "experts", l, m.split(".experts.")[1].split(".")[-2] if ".experts." in m else m
+            # the part name: "...experts.gate_up_proj" (packed) or "...experts.12.down_proj.weight" (per expert)
+            tail = m.split(".experts.")[1].split(".")
+            part = tail[1] if tail[0].isdigit() and len(tail) > 1 else tail[0]
+            return "experts", l, part
         if "hyper_connection" in m or ".hc_" in m:
             return "hc", l, m
         return "dense", l, m
@@ -144,10 +151,12 @@ def config_summary(cfg):
     kinds = {}
     for lt in layer_types or []:
         kinds[lt] = kinds.get(lt, 0) + 1
+    # every non-linear layer kind holds a KV cache (full_attention, qwen_sparse_attention, deepseek_sparse_attention)
+    full_kinds = sum(v for k, v in kinds.items() if k != "linear_attention")
     q = cfg.get("quantization_config") or t.get("quantization_config") or {}
     n_kv = t.get("num_key_value_heads") or t.get("num_attention_heads")
     head_dim = t.get("head_dim") or (t.get("hidden_size", 0) // max(1, t.get("num_attention_heads", 1)))
-    full = kinds.get("full_attention", L if not layer_types else 0)
+    full = full_kinds if layer_types else L
     mtp = t.get("mtp") or {}
     out = {
         "architecture": (cfg.get("architectures") or ["?"])[0], "model_type": cfg.get("model_type"),

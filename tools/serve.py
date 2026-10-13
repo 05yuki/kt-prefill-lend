@@ -131,7 +131,7 @@ def main():
         hot = d["hot"]  # the profile's measured value; the plan is printed beside it
     else:
         hot = plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"]
-    chunk = a.chunk or plan["chunk"]
+    chunk = a.chunk or d.get("chunk") or plan["chunk"]
     threads = a.threads or plan["threads"]
     key = f"tp{tp}-ctx{context}-mamba{mamba_slots}-{os.path.basename(experts_dir.rstrip('/'))}"
     vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "tp": tp,
