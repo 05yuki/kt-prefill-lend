@@ -14,10 +14,9 @@ Qwen3.8-Flash-Next (NVFP4 MoE, 2x RTX 5070 Ti 16 GB, dual EPYC 7452):
 | KV pool | 231,616 tokens | 262,144 tokens |
 | output | | bit-identical |
 
-Same day, same prompts, same server; the only change is the lend
-(the project's name for the mechanism; `kt-prefill-lend` is the repo).
-Five more models, including DeepSeek V4.1 at a 1M-token context, are in
-[Results](#results).
+Same prompts, same server; the only change is the lend (the project's name
+for the mechanism; `kt-prefill-lend` is the repo). Five more models, including
+DeepSeek V4.1 at a 1M-token context, are in [Results](#results).
 
 ## How it works
 
@@ -27,43 +26,97 @@ GPU, chunk by chunk. Every forward pays a fixed transfer cost, so a larger
 chunk is faster, but on a 16 GB card the chunk is capped by what the decode
 footprint (attention weights, hot experts, KV pool, CUDA graphs) leaves free.
 
-During such a prefill this patch pauses the decoder-layer weights with
+During such a prefill the lend pauses the decoder-layer weights with
 [torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) (physical
 memory released, virtual addresses kept, so the decode CUDA graphs stay
 valid) and streams each layer's weights back from a pinned host copy just
 before that layer runs. Buffers only a prefill uses live in a second region,
 the *scratch*, that is resident only during prefill. Everything is back
 before the next decode step. The prefill gets several GB more, the chunk
-grows, and the forward count drops. By default the KV pool keeps every token
-it would have without the lend.
+grows, and the forward count drops. The KV pool keeps every token it would
+have without the lend.
 
-## Ten minutes to try it
+## Serving a model
 
-Flash-Next from a GGUF, from nothing (the whole serve: the two patched trees,
-a venv with the measured versions, kt-kernel built for your CPU and GPU, the
-model directories, a sized launch):
+The repo serves from a *profile*: `profiles/<name>.json` holds the SGLang
+command and environment of a measured launch with every host- and size-
+dependent value as a placeholder (`{config_dir}`, `{hot}`, `{context}`,
+`{placement}`, ...), the defaults it ran with per TP, and the VRAM constants
+calibrated from its log. `tools/serve.py` fills a profile in from the host
+and the model and starts the server:
 
 ```sh
-tools/install.sh ~/kt-serve                                  # clone, patch, venv, build (10-20 min)
-tools/make-config-dir.py <HF dir> <gguf dir> ~/kt-serve/config      # config + tokenizer, quant_method gguf
-~/kt-serve/venv/bin/python tools/make-draft-dir.py <mtp gguf> <HF dir> ~/kt-serve/draft   # the MTP draft (optional)
-tools/serve.py --venv ~/kt-serve/venv --tree ~/kt-serve/sglang --config-dir ~/kt-serve/config \
-               --gguf <gguf dir> --draft-dir ~/kt-serve/draft --tp 1 --context 65536
+tools/serve.py --profile <name> --venv <venv> --tree <patched sglang tree> --config-dir <model dir> \
+               [--gguf DIR] [--draft-dir DIR] [--placement FILE] [--tp 1|2] [--context T] [--hot N] [--dry-run]
 ```
 
-`serve.py` probes the host (`hostprobe.py`), sizes the launch (`plan-launch.py`:
-hot experts per layer, chunk, threads, NUMA binding, printed with the
-arithmetic) and starts SGLang with the knobs the numbers in this README were
-measured with; `--dry-run` prints the command, `--hot` / `--chunk` /
-`--mem-fraction` override the plan, `--tp 2` takes both cards. The HF dir is
-the checkpoint's config and tokenizer (Qwen3.8-Flash-Next); the GGUF dir is
-Strata's IQ3_S set or any Flash-Next GGUF with expert types the CPU kernels
-have (`trees/kt-kernel/`). The steps below are for adding the lend to another
-tree.
+It probes the host (`hostprobe.py`: GPUs by NUMA node, cores and RAM per
+node, THP / swap / `min_free_kbytes`), reads the model (`modelprobe.py`:
+experts and their slot size, dense bytes, the KV family and its bytes per
+token, all from the weight headers), sizes the launch (`plan-launch.py`: the
+per-rank VRAM budget spent in order — dense, lm_head, draft, the KV pool for
+the context, linear-attention states, graphs, workspace — and the hot experts
+per layer that remain, minus what the empty pool lends), binds each rank to
+its socket, and prints the command with the arithmetic. `--dry-run` prints
+without starting; `--hot` / `--chunk` / `--mem-fraction` override the plan.
 
+Profiles in the repo, each verified by the same prompt-NLL check (three fixed
+texts scored teacher-forced on the in-house launcher and on `serve.py`,
+identical to four decimals):
 
-On a server you already run (the trees and the streamer are described under
-[Who this is for](#who-this-is-for)):
+| profile | model | TP | KV | pool |
+|---|---|---|---|---|
+| `flash-next-gguf` | Qwen3.8-Flash-Next from Strata's IQ3_S GGUF, MTP draft | 1 / 2 | bf16 | 65,536 / 121,152 |
+| `flash-next-nvfp4` | Qwen3.8-Flash-Next NVFP4 (ModelOpt) | 2 | bf16 | 262,144 |
+| `glm53-flash` | GLM-5.3-Flash, NVFP4 experts, full-GPU prefill | 2 | bf16 | 131,072 |
+| `dsv4-flash-vision` | DeepSeek V4-Flash-Vision MXFP4, 1M context | 2 | fp8 | 262,144 |
+| `mimo-v26-flash` | MiMo-V2.6-Flash MXFP4 | 2 | fp8 | 262,144 |
+
+**A new model** takes one launch of whatever launcher already runs it:
+
+```sh
+tools/profile-from-launch.py --pid <launch_server pid> --name <name> --out profiles/<name>.json \
+                             --config-dir <model dir> [--experts DIR] [--draft-dir DIR] --cache-dir <dir>
+tools/plan-calibrate.py <that launch's server.log> --hot N --slot-bytes B --moe-layers L \
+                        --vram-total BYTES --mem-fraction F [--kv-dtype fp8] --write profiles/<name>.json
+```
+
+The first reads the running process's environment and command line and turns
+the paths and sized values into placeholders (nothing is transcribed from a
+script). The second reads the log's accounting lines (weights, KV pool,
+states, graphs; DeepSeek V4's hybrid pool lines included) and writes the
+constants the plan then uses: with them, the plan predicts the pool and the
+hot count of a launch at another memory fraction or context without a second
+launch. Without a profile, `plan-launch.py` still sizes a launch from the
+headers alone; its constants are then the ones measured on our cards and are
+printed with every plan.
+
+What stays model-specific: a hot-expert placement file (`--placement`, a JSON
+of the hottest experts per layer from an earlier run). Without one the serve
+runs the loader's trivial placement, which is valid but a different set of
+GPU experts, so its NLL differs from a placed launch's.
+
+### From nothing
+
+Flash-Next from a GGUF, the whole serve (both patched trees, a venv with the
+measured versions, kt-kernel built for your CPU and GPU, the model
+directories, a sized launch):
+
+```sh
+tools/install.sh ~/kt-serve                                                 # clone, patch, venv, build (10-20 min)
+tools/make-config-dir.py <HF dir> <gguf dir> ~/kt-serve/config               # config + tokenizer, quant_method gguf
+~/kt-serve/venv/bin/python tools/make-draft-dir.py <mtp gguf> <HF dir> ~/kt-serve/draft   # the MTP draft (optional)
+tools/serve.py --profile flash-next-gguf --venv ~/kt-serve/venv --tree ~/kt-serve/sglang \
+               --config-dir ~/kt-serve/config --gguf <gguf dir> --draft-dir ~/kt-serve/draft --tp 1 --context 65536
+```
+
+The HF dir is the checkpoint's config and tokenizer; the GGUF dir is Strata's
+IQ3_S set or any Flash-Next GGUF with expert types the CPU kernels have
+(`trees/kt-kernel/`). `trees/flash-next-gguf/` is the serving tree as one
+patch on upstream `release/v0.5.19` (the streamer, the lend, the hot cache,
+the KV lend, the GGUF loader); `trees/glm53/` the same for GLM-5.3.
+
+### On a server you already run
 
 ```sh
 pip install torch_memory_saver==0.0.9.post1          # in the server's venv
@@ -79,14 +132,14 @@ side (calibration, the KV guard); `KT_PREFILL_LEND=0` turns it off.
 
 ## Who this is for
 
-People who already run a KTransformers hybrid (kt-kernel built for their
-CPU, experts on the CPU, SGLang serving attention and hot experts on the GPU)
-and are comfortable patching an SGLang tree. This is not a packaged install:
-each model here runs on its own SGLang tree, the expert streamer the patches
-edit is not in upstream SGLang (`streamers/` has the versions they expect),
-and the DeepSeek V4 zero-copy streamer also needs kt-kernel built with
-shared-memory expert arenas. Once applied it needs no tuning: the chunk is
-calibrated on the first launch, and a tree without the patch runs as before.
+People who run a KTransformers hybrid (kt-kernel built for their CPU, experts
+on the CPU, SGLang serving attention and hot experts on the GPU) and are
+comfortable patching an SGLang tree. Each model here runs on its own SGLang
+tree, the expert streamer the patches edit is not in upstream SGLang
+(`streamers/` has the versions they expect), and the DeepSeek V4 zero-copy
+streamer also needs kt-kernel built with shared-memory expert arenas. Once
+applied it needs no tuning: the chunk is calibrated on the first launch, and
+a tree without the patch runs as before.
 
 ## Results
 
@@ -98,11 +151,11 @@ the same server without the lend.
 
 | Model | hot experts | chunk | 38K prompt | 114K prompt | decode | quality vs base |
 |---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next NVFP4 | 32 | 2048 -> 16384 | 1,336-1,337 -> **4,153-4,154** | 1,367 -> **4,596** (105K) | 58.5-58.7 -> 54.8-59.3 | bit-identical ² |
+| Qwen3.8-Flash-Next NVFP4 | 32 | 2048 -> 16384 | 1,336-1,337 -> **4,153-4,154** | 1,367 -> **4,596** (105K) | 58.5-58.7 -> 54.8-59.3 | bit-identical |
 | Qwen3.5-35B-A3B bf16 | 48 | 2048 -> 32768 | 1,568 -> **6,492-6,507** | 1,533 -> **6,406** | 91-97 -> 98-100 | bit-identical |
-| MiMo-V2.6-Flash MXFP4 | 12 | 2048 -> 22528 | 525 -> **1,962-1,978** | 496 -> **1,550** | 30-32 -> 32 | top-20 spread unchanged ¹ |
-| DeepSeek V4.1-Flash MXFP4, 1M ctx | 5 | 2048 -> 6144 | 255 -> **576** | 259 -> **596** | 25.4-25.6 -> 27.6-28.0 | NLL z -1.90 ¹ |
-| DeepSeek V4-Flash-Vision MXFP4 | 10 -> 12 | 2048 -> 16384 | 601 -> **900-919** | 598 -> **849** | 36.5-39.9 -> 42.5-44.8 | NLL z -0.58 ¹ |
+| MiMo-V2.6-Flash MXFP4 | 12 | 2048 -> 22528 | 525 -> **1,962-1,978** | 496 -> **1,550** | 30-32 -> 32 | top-20 spread unchanged |
+| DeepSeek V4.1-Flash MXFP4, 1M ctx | 5 | 2048 -> 6144 | 255 -> **576** | 259 -> **596** | 25.4-25.6 -> 27.6-28.0 | NLL z -1.90 |
+| DeepSeek V4-Flash-Vision MXFP4 | 10 -> 12 | 2048 -> 16384 | 601 -> **900-919** | 598 -> **849** | 36.5-39.9 -> 42.5-44.8 | NLL z -0.58 |
 | GLM-5.3-Flash NVFP4 experts | 0 -> 10 | 2048 -> 14336 | 163 -> **326-327** | 155 -> **292** | 18.3 -> 19.9-20.1 | NLL z -0.35 / -1.04 |
 
 V4.1 keeps its whole 1,048,576-token KV pool and prefills a 989,154-token
@@ -113,10 +166,10 @@ prompt to the end at chunk 6144 (2,433.9 s, the server's first prefill); see
 
 | Model, setup | chunk | 38K prompt | 114K prompt | decode | quality vs base |
 |---|---|---|---|---|---|
-| Qwen3.5-35B-A3B bf16, TP=1, one card, one socket, hot 16, 131K ctx | 2048 -> 23552 | 893-894 -> **5,142-5,157** | 912 -> **4,341** | 37.4 -> 37.0-37.2 | bit-identical ³ |
-| Qwen3.5-35B-A3B bf16, TP=2, one socket | 2048 -> 32768 | 821-822 -> **4,492-4,507** | 826 -> **4,967** | 82.9-84.3 -> 79.5-83.6 | bit-identical ³ |
-| Qwen3.8-Flash-Next NVFP4, TP=1, one card, one socket, hot 1, 131K ctx | 2048 -> 14336 | (out of memory) -> **3,030-3,069** | **3,232** | 27.1 | bit-identical ³ |
-| MiMo-V2.6-Flash MXFP4, TP=1, one card, one socket, hot 0, 131K ctx | 2048 -> 16384 ⁴ | 151 -> **1,098-1,104** | (over the KV pool) | 12.5-12.8 -> 12.4-12.6 | bit-identical where the chunking matches ³ |
+| Qwen3.5-35B-A3B bf16, TP=1, one card, one socket, hot 16, 131K ctx | 2048 -> 23552 | 893-894 -> **5,142-5,157** | 912 -> **4,341** | 37.4 -> 37.0-37.2 | bit-identical |
+| Qwen3.5-35B-A3B bf16, TP=2, one socket | 2048 -> 32768 | 821-822 -> **4,492-4,507** | 826 -> **4,967** | 82.9-84.3 -> 79.5-83.6 | bit-identical |
+| Qwen3.8-Flash-Next NVFP4, TP=1, one card, one socket, hot 1, 131K ctx | 2048 -> 14336 | (out of memory) -> **3,030-3,069** | **3,232** | 27.1 | bit-identical |
+| MiMo-V2.6-Flash MXFP4, TP=1, one card, one socket, hot 0, 131K ctx | 2048 -> 16384 | 151 -> **1,098-1,104** | (over the KV pool) | 12.5-12.8 -> 12.4-12.6 | bit-identical where the chunking matches |
 
 On one 16 GB card the lend is what makes room for the prefill at all:
 without it Flash-Next ran out of memory on its first 8K prefill at the same
@@ -126,30 +179,21 @@ and 1,188-row batches (its SWA pool held 1,190 tokens) where the lend kept
 
 The lend chunk is the one the calibration picked. *Bit-identical*: top-20
 next-token logprobs at 312/548/1,512-token prompts match the base server bit
-for bit. *NLL z*: the same token ids read teacher-forced on both servers, z
-of the mean per-token log-prob difference (negative = lend side lower).
-*Top-20 spread*: MiMo at TP=2 does not repeat bit for bit even without the
-lend, so the lend side's top-20 logprobs were checked to stay within the
-base's run-to-run spread, with the same top-1.
-
-¹ Measured on an earlier lend setup (MiMo at chunk 8192, V4.1 at chunk 4096,
-Vision at hot 10 and chunk 8192), not on the row's.
-² Base and lend measured the same day (10-07) with the same prompts and harness; the lend was developed on this model, so this base row came last. The KV pool also grows with the lend here, 231,616 -> 262,144 tokens.
-³ Also bit-identical to itself after twelve prompts of different lengths
-with `KT_STREAM_GRAPH_KEEP=2`, which drops and re-captures the streamer's
-CUDA graphs. MiMo at 1,725 tokens: the base server split that prompt
-1,188 + 537 (its small SWA pool) and differs; at 358 and 634 tokens, where
-both run one chunk, they match.
-⁴ Batches held at 12.4K rows by the SWA pool; see `KT_PREFILL_LEND_SWA_FIT`.
+for bit, also after twelve prompts of different lengths with
+`KT_STREAM_GRAPH_KEEP=2`, which drops and re-captures the streamer's CUDA
+graphs. *NLL z*: the same token ids read teacher-forced on both servers, z of
+the mean per-token log-prob difference (negative = lend side lower). *Top-20
+spread*: MiMo at TP=2 does not repeat bit for bit even without the lend, so
+the lend side's top-20 logprobs were checked to stay within the base's
+run-to-run spread, with the same top-1.
 
 Why the gains differ: Qwen3.5 and MiMo forwards are mostly fixed cost (4x),
 V4.1 and GLM about half (2x), and Vision's forward already scales with its
-rows at chunk 8192 (1.4x). Decode never got slower.
+rows (1.4x). Decode never got slower.
 
 GLM-5.3 has no streamer; its full-GPU prefill writes every expert of a layer
-into a 2.11 GiB slot, which used to be reserved out of the KV pool, so hot
-experts and the GPU prefill excluded each other. With the slot in the scratch
-both run in one server, and the KV pool still grew (198K -> 213K tokens).
+into a 2.11 GiB slot that lives in the scratch, so hot experts and the GPU
+prefill run in one server and the KV pool still grows (198K -> 213K tokens).
 
 ## Long prompts
 
@@ -170,12 +214,12 @@ the prefill baseline:
 | 991K | 5,286 | 2,921 | 6,272 (989K) |
 
 The calibration hinted 9216, 8192 and 6144 at the three prefixes and kept
-6144. Reserved runs well above allocated at long prefixes: each chunk's
+6144. Reserved runs above allocated at long prefixes: each chunk's
 prefix-sized buffers are a little larger than the last's and do not fit the
 freed ones. The lend hands torch's unused segments back before every chunk
-past 64K tokens, which removes most of it between forwards (2048 rows at
-993K: 3,028 -> 994 MiB of the gap) but not inside one; torch's
-`expandable_segments` would, and torch_memory_saver does not support it yet.
+past 64K tokens, which removes most of it between forwards but not inside
+one; torch's `expandable_segments` would, and torch_memory_saver does not
+support it.
 
 ## Applying it
 
@@ -183,9 +227,9 @@ past 64K tokens, which removes most of it between forwards (2048 rows at
    lend uses its hook mode `torch`).
 2. On a tree with the expert streamer, keep its CUDA graphs bounded:
    `python patches/sglang-kt-stream-graph-keep.py <sglang tree>`. The
-   streamer captured one graph per row count and kept them all; a prompt's
-   last chunk brings a new row count, so the device memory outside torch rose
-   12-14 MiB per prompt of a new length until the weights could not come back.
+   streamer captures one graph per row count; a prompt's last chunk brings a
+   new row count, and unbounded graphs cost 12-14 MiB of device memory per
+   prompt of a new length until the weights cannot come back.
 3. On a DeepSeek V4 tree (V4.1, V4-Flash, Vision, MiMo), share the streamer's
    graph inputs across chunk sizes:
    `python patches/sglang-kt-stream-shared-graph-inputs.py <sglang tree>`.
@@ -240,17 +284,16 @@ full pool. The lend takes nothing from the KV pool by default:
   that, the chunk it ran is remembered as one that cuts the KV pool and the
   next launch goes 1024 below it. Where even chunk 2048 does not reach the
   cap (memory, not the lend), the full pool at 2048 becomes the reference.
-- On V4.1 a chunk of 10240 cut the full pool from 1,048,576 to 896,000
-  (114K prompts 790 tok/s instead of about 600), so its launcher stays at
-  6144. The SWA cap counts two chunks in flight, while the overlap scheduler
-  still holds the previous chunk's slots, so every other batch came in at
-  3072 rows; the launcher adds prefix tails to fill them only as far as the
-  pool's slack pays (13 tails at 6144, budget 1,049,856 for a cap of
-  1,048,576).
+- On V4.1 a chunk of 10240 cuts the full pool from 1,048,576 to 896,000, so
+  its launcher stays at 6144. The SWA cap counts two chunks in flight, while
+  the overlap scheduler still holds the previous chunk's slots, so every other
+  batch comes in at 3072 rows; the launcher adds prefix tails to fill them
+  only as far as the pool's slack pays (13 tails at 6144, budget 1,049,856
+  for a cap of 1,048,576).
 - `kt_lend_swa_ratio` (ratio-sized SWA pools: V4-Flash, Vision, MiMo)
   computes the ratio from the cap. `KT_PREFILL_LEND_SWA_FIT=1` computes it
   from the full pool an earlier launch got instead, which trades KV for
-  chunk: MiMo on one card went from 12.1K- to 13.9K-row batches (40K prompts
+  chunk: MiMo on one card goes from 12.1K- to 13.9K-row batches (40K prompts
   1,107 -> 1,331 tok/s) and from a 97,699- to an 81,552-token full pool.
 
 ## Requirements and limits
@@ -259,9 +302,9 @@ full pool. The lend takes nothing from the KV pool by default:
   nothing is lent.
 - Prefill must run eagerly (no prefill CUDA graphs); decode graphs are fine.
 - Tested on one host: TP=2 over two sockets, TP=2 on one socket, TP=1 on one
-  card and one socket. Not tested: EP, DP attention, PP, a speculative draft
-  model (a draft built after the target stays resident), SGLang's own
-  `--enable-memory-saver`.
+  card and one socket. Not tested: EP, DP attention, PP, SGLang's own
+  `--enable-memory-saver`. A speculative draft built after the target stays
+  resident.
 - A model whose layers read another layer's weights, or code outside the
   decoder that reads decoder weights during prefill, faults (illegal address)
   instead of reading stale data. `KT_PREFILL_LEND_SKIP` (default `engram`)
@@ -287,8 +330,7 @@ full pool. The lend takes nothing from the KV pool by default:
   and torch's cache is emptied before each chunk.
 - `KT_PREFILL_LEND_IDLE` — parameter-name substrings lent but not brought
   back during a prefill, for weights the prefill never reads (GLM's hot
-  experts; measured within 1%, so off by default). Turns `LONG_SEQ`'s first
-  part off.
+  experts; within 1%, so off by default). Turns `LONG_SEQ`'s first part off.
 - `KT_PREFILL_LEND_PFONLY` — parameter-name substrings only the prefill
   reads: the lend in reverse, decode borrowing the prefill's memory. Such a
   weight stays out of the decode spans (it is in the pinned mirror and in the
@@ -329,37 +371,19 @@ compute the same thing — are read only by the prefill. With
 Where the room goes matters. The KV pool stays resident through a prefill, the
 lent weights do not; so freed decode memory is better given to lent weights
 (more hot experts) than to a larger pool, which keeps that room out of every
-prefill. When this section was written (10-10) the 64-hot row with the pool
-grown to 131,072 tokens ran out of memory in the 35K prefill (6,121 MiB free
-in the prefill window); in the re-measurement below, with a lighter MTP draft
-and memory freed elsewhere in the serving tree since, it fits, and its decode
-stays where the 64-hot row is. Flash-Next (GGUF, one MTP draft step, two 16 GB
-cards, Japanese-fiction decode, 35K-token streamed prefill at chunk 16384):
-
-**Correction (2026-10-12).** The decode figures first published in this table
-(83.3 and 86.2-87.2 tok/s) were measured with a bug in the serving tree's
-dynamic hot-expert cache (not part of this repository): the CPU side skipped
-every expert whose id was below the number of GPU slots, also when the cache
-did not hold it, so those routes were computed by nobody. Decode was faster
-than the model allows. The table is re-measured with the fix: same prompts,
-35K brief and settings as on 10-10, except the MTP draft, now the GGUF
-release's own draft head (Q2_0 experts) instead of a draft from another
-checkpoint, so the serve comes from one GGUF. The serving tree has also gained
-decode work since 10-10, so the new figures are not the old ones minus the
-bug; the rows are comparable with each other (two launches each, interleaved).
+prefill. Flash-Next (GGUF, one MTP draft step with the GGUF release's own
+Q2_0 draft, two 16 GB cards, Japanese-fiction decode, 35K-token streamed
+prefill at chunk 16384; two launches each, interleaved):
 
 | | KV pool | prefill window free / peak | 35K prefill + 200 | decode, mean of 8 |
 |---|---|---|---|---|
 | no reverse lend, 64 hot experts | 121,152 | 8.90 / 6.83 GB | 11.3-11.4 s | 104.6-106.2 tok/s |
-| reverse lend, 64 hot (pool grows) | 131,072 | 8.41 / 6.85 GB (10-10: out of memory) | 11.2 s | 104.8 tok/s (one launch) |
+| reverse lend, 64 hot (pool grows) | 131,072 | 8.41 / 6.85 GB | 11.2 s | 104.8 tok/s (one launch) |
 | reverse lend, 84 hot, pool held | 121,152 | 8.57 / 6.85 GB | 11.3-11.5 s | 107.0-109.5 tok/s |
-| the same + hot experts in the KV pool's free pages ⁵ | 121,152 | 8.57 / 6.85 GB | 11.4 s | 110.8-111.9 tok/s |
+| the same + hot experts in the KV pool's free pages | 121,152 | 8.57 / 6.85 GB | 11.4 s | 110.8-111.9 tok/s |
 
-⁵ A feature of the serving tree, not of this repository: hot-expert slots
-placed in the KV pages the allocator has free, counted as free and given back
-whenever the KV needs them (before every streamed prefill, and to any
-allocation that would otherwise wait), so the pool and the prefill window are
-unchanged; here 18-19 more slots per layer after the 35K.
+The last row is the KV lend of the next section: 18-19 more slots per layer
+after the 35K, with the pool and the prefill window unchanged.
 
 ## Hot experts, and the KV pool's free pages
 
@@ -404,16 +428,12 @@ within launch noise for the cache and identical token by token for the lend;
 the cache's correctness is checked against an exact reference
 (`KT_HOT_KV_LEND_CHECK=1` compares every lent slot with its bank before it is
 zeroed). Two cards gain nothing from the lend (the pool's pages are the only
-free VRAM at one card, not at two), so it is on for one card and off for two
-in our launcher.
+free VRAM at one card, not at two), so the profile has it on for one card and
+off for two.
 
-For Flash-Next, do not apply these one by one: `trees/flash-next-gguf/`
-holds the whole serving tree as one patch on upstream `release/v0.5.19`
-(the streamer, both editions, the lend, the cache, the KV lend, the GGUF
-loader), which is how the numbers above were measured. The scripts below are
-for wiring the cache into another tree that already runs the KT wrapper with
-GGUF experts and the lend; each takes the SGLang tree as its argument and
-copies the modules from `hot/` into `python/sglang/srt/layers/moe/`:
+The scripts below wire the cache into another tree that already runs the KT
+wrapper with GGUF experts and the lend; each takes the SGLang tree as its
+argument and copies the modules from `hot/` into `python/sglang/srt/layers/moe/`:
 
 ```
 python hot/sglang-kt-gguf-hot.py   <sglang tree>   # the GPU hot-expert method for GGUF experts
@@ -425,34 +445,23 @@ python hot/sglang-kt-hot-kv-lend.py <sglang tree>  # the KV-page lend, KT_HOT_KV
 The window kernel is built on first use with torch's `load_inline` (its source
 is generated from sgl-kernel's GGUF kernels by `hot/kt-gguf-moe-multi-build.py`;
 Apache-2.0 / MIT, see the file header). The cache copies experts from pinned
-host banks: our tree takes them from its GGUF prefill streamer, which is not
-in this repo; without it the cache pins its own (`KT_HOT_BANKS=own` forces
-this even with the streamer), which costs the experts' size in pinned RAM,
-about 80 s more on every launch (the banks are pinned layer by layer at the
-first fill; later swaps read them), and we measured one KV page group less
-(65,024 instead of 65,536 tokens of pool) at one card.
+host banks: with the GGUF prefill streamer it takes the streamer's; without
+it the cache pins its own (`KT_HOT_BANKS=own` forces this even with the
+streamer), which costs the experts' size in pinned RAM, about 80 s more on
+every launch, and one KV page group (65,024 instead of 65,536 tokens of pool
+at one card).
 
 Knobs: `KT_GPU_EXPERTS` (the launcher's `--kt-num-gpu-experts`),
 `KT_HOT_INTERVAL` (32), `KT_HOT_SWAPS` (8 per layer per round), `KT_HOT_DECAY`
 (0.9), `KT_HOT_KV_LEND_MAX` (64 lent slots per layer at most),
 `KT_HOT_FUSED_ROUTE` / `KT_HOT_FUSED_COMBINE` (one Triton kernel each for the
 table lookups and for the route weighting + sum; identical results), `KT_HOT_LOG`.
-A seed placement (`KT_EXPERT_PLACEMENT`, a JSON of the hottest experts per
-layer from an earlier run) shortens the warm-up; without it the cache starts
-from the loader's static placement and converges within a few hundred steps.
+A seed placement (`KT_HOT_SEED`, a JSON of the hottest experts per layer from
+an earlier run) shortens the warm-up; without it the cache starts from the
+loader's static placement and converges within a few hundred steps.
 
-Sizing it: `tools/hostprobe.py` (your GPUs by NUMA node, cores and RAM per
-node, THP / swap / min_free_kbytes), `tools/modelprobe.py <model dir> [--gguf
-DIR]` (experts, their per-slot size, dense bytes, KV bytes per token, from
-the weight headers alone) and `tools/plan-launch.py <model dir> --tp N
---context T` (the per-rank VRAM budget spent in order — dense, lm_head, draft,
-the KV pool for the context, linear-attention states, graphs, workspace — and
-the hot experts per layer that remain, minus what the empty pool lends).
-Its constants are the ones measured on our cards and are printed with every
-plan; your first launch log corrects them.
-
-Measured on Flash-Next only. Other GGUF MoE models need their expert tensor
-names (`blk.N.ffn_{gate,up,down}_exps.weight`) and a kernel for their types
+Measured on Flash-Next. Other GGUF MoE models need their expert tensor names
+(`blk.N.ffn_{gate,up,down}_exps.weight`) and a kernel for their types
 (`kt_gguf_moe_multi.py` lists them).
 
 ## How it is wired
