@@ -165,7 +165,7 @@ def main():
         hot = plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"]
         hot = max(0, hot + corr.get("hot_delta", 0))  # learned from an earlier launch's pool (see --calibrate)
     chunk = a.chunk or d.get("chunk") or plan["chunk"]
-    threads = a.threads or plan["threads"]
+    threads = a.threads or d.get("threads") or plan["threads"]
     vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "tp": tp,
             "numa_nodes": " ".join(str(g["numa_node"]) for g in ranks), "context": context, "mem_fraction": mem_fraction,
             "kv_cache_dtype": "fp8_e4m3" if kv_dtype == "fp8" else "bfloat16", "mamba_slots": mamba_slots, "hot": hot,

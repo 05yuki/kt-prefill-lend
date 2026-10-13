@@ -51,6 +51,9 @@ def plan(host, model, a):
     b = model["buckets"]
     dense = b.get("dense", {}).get("bytes", 0) / tp + b.get("hc", {}).get("bytes", 0)  # hc replicated
     lm_head = b.get("lm_head", {}).get("bytes", 0) / tp
+    if c.get("tie_word_embeddings") and not lm_head and a.embed_host:
+        lm_head = model["embed_bytes"] / tp  # tied, table in host memory: a GPU copy still serves as lm_head
+    # tied with the table on the GPU: one tensor, already counted as the token table
     embed = 0 if a.embed_host else model["embed_bytes"] / tp
     draft = a.draft_bytes if a.draft_bytes is not None else (model["draft_bytes"] / tp or (0.84 * GiB if c["mtp_layers"] else 0))
     if a.draft_bytes is None and model["draft_bytes"] == 0 and c["mtp_layers"]:
@@ -59,7 +62,7 @@ def plan(host, model, a):
     kv_tok = (c.get("kv_bytes_per_token_bf16") or 0) / (1 if c.get("kv_layout") == "mla" else tp)
     if a.kv_dtype == "fp8":
         kv_tok /= 2
-    kv = a.context * kv_tok
+    kv = a.context * kv_tok + (c.get("kv_window_bytes_bf16") or 0) / tp * (0.5 if a.kv_dtype == "fp8" else 1)
     lin = (c.get("linear_state_bytes_per_seq_bf16") or 0) / tp * a.mamba_slots
     cal = a.constants_dict
     if cal:

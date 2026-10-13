@@ -162,7 +162,7 @@ def config_summary(cfg):
         "architecture": (cfg.get("architectures") or ["?"])[0], "model_type": cfg.get("model_type"),
         "num_hidden_layers": L, "layer_kinds": kinds or {"full_attention": L}, "hidden_size": t.get("hidden_size"),
         "vocab_size": t.get("vocab_size"), "max_position_embeddings": t.get("max_position_embeddings"),
-        "num_experts": t.get("num_experts") or t.get("n_routed_experts"), "experts_per_tok": t.get("num_experts_per_tok"),
+        "num_experts": t.get("num_experts") or t.get("n_routed_experts"), "experts_per_tok": t.get("num_experts_per_tok") or t.get("top_k_experts"),
         "moe_intermediate_size": t.get("moe_intermediate_size"), "shared_expert_intermediate_size": t.get("shared_expert_intermediate_size"),
         "num_attention_heads": t.get("num_attention_heads"), "num_key_value_heads": n_kv, "head_dim": head_dim,
         "full_attention_layers": full, "mtp_layers": t.get("mtp_num_hidden_layers") or mtp.get("num_hidden_layers") or t.get("num_nextn_predict_layers") or 0,
@@ -179,6 +179,16 @@ def config_summary(cfg):
     if t.get("kv_lora_rank"):
         out["kv_layout"] = "mla"
         out["kv_bytes_per_token_bf16"] = full * (t["kv_lora_rank"] + (t.get("qk_rope_head_dim") or 0)) * 2
+    elif kinds.get("sliding_attention"):
+        # Gemma-style: sliding layers keep a window of KV (a constant), only the global layers grow with the context;
+        # the global layers may have their own kv heads / head dim
+        out["kv_layout"] = "gqa+swa"
+        g_kv = t.get("num_global_key_value_heads") or n_kv
+        g_dim = t.get("global_head_dim") or head_dim
+        glob = kinds.get("full_attention", 0)
+        out["full_attention_layers"] = glob
+        out["kv_bytes_per_token_bf16"] = glob * 2 * g_kv * g_dim * 2
+        out["kv_window_bytes_bf16"] = kinds["sliding_attention"] * (t.get("sliding_window") or 0) * 2 * n_kv * head_dim * 2
     else:
         out["kv_layout"] = "mha"
         out["kv_bytes_per_token_bf16"] = full * 2 * n_kv * head_dim * 2 if n_kv and head_dim else None
@@ -264,6 +274,7 @@ def table(r):
         lines.append(f"experts {c['num_experts']} top-{c['experts_per_tok']}, moe intermediate {c['moe_intermediate_size']}, shared {c['shared_expert_intermediate_size']}")
     if c.get("kv_bytes_per_token_bf16"):
         lines.append(f"KV {c['kv_bytes_per_token_bf16'] / 1024:.1f} KiB per token (bf16, {c['kv_layout']}, {c['full_attention_layers']} full-attention layers)" +
+                     (f" + a fixed {c['kv_window_bytes_bf16'] / 2**20:.0f} MiB for the sliding windows" if c.get("kv_window_bytes_bf16") else "") +
                      (f"; linear-attention state {c['linear_state_bytes_per_seq_bf16'] / 2**20:.1f} MiB per sequence" if c.get("linear_state_bytes_per_seq_bf16") else ""))
     for b, d in sorted(r["buckets"].items(), key=lambda kv: -kv[1]["bytes"]):
         types = ", ".join(f"{t} {gb(n)}" for t, n in sorted(d["types"].items(), key=lambda kv: -kv[1])[:4])

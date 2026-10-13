@@ -1,6 +1,6 @@
 {
   "name": "flash-next-nvfp4",
-  "description": "Qwen3.8-Flash-Next from an NVFP4 checkpoint (NVIDIA's, or an in-house NVFP4 of an abliterated model): KT NVFP4 CPU experts, a static hot-expert placement, the NVFP4 streamer edition with the lend, the int8 hc mix, the token table in host memory, two-step MTP from the bf16 draft dir with fp8-padded experts. TP2 as measured (decode ~58, 38K prefill ~4,150 t/s).",
+  "description": "Qwen3.8-Flash-Next from an NVFP4 checkpoint (NVIDIA's, or an in-house NVFP4 of an abliterated model): KT NVFP4 CPU experts, a static hot-expert placement, the NVFP4 streamer edition with the lend, the bf16 hc mix (the int8 mix with the prefill-only lend is a GGUF-stack default, not measured here), the token table in host memory, two-step MTP from the bf16 draft dir with fp8-padded experts. TP2 as measured (decode ~58, 38K prefill ~4,150 t/s).",
   "tree": "sglang-v0.5.19 + trees/flash-next-gguf (the same one patch; this profile uses its NVFP4 paths)",
   "weights": {
     "gguf": false,
@@ -136,12 +136,10 @@
     "KT_GPU_EXPERTS": "{hot}",
     "KT_EXPERT_SHM": "1",
     "KT_MXFP4_SCALE_CODES": "0",
-    "KT_HC_FP8": "int8",
-    "KT_HC_FP8_ALL": "1",
-    "KT_PREFILL_LEND_PFONLY": "input_mix_weight",
     "KT_TASKQUEUE_SPIN_US": "300",
     "SGLANG_HOST_STAGED_ALLREDUCE": "1",
-    "SGLANG_LL_ALLREDUCE": "1"
+    "SGLANG_LL_ALLREDUCE": "1",
+    "KT_HC_FP8": "0"
   },
   "env_by_tp": {
     "2": {}
