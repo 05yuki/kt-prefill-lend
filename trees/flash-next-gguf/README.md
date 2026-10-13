@@ -54,9 +54,8 @@ It also needs:
   with its LLAMAFILE CPU backend, plus the i-quant kernels for AVX2 hosts
   ([kvcache-ai/ktransformers#2240](https://github.com/kvcache-ai/ktransformers/pull/2240),
   until merged) — Strata's IQ3_S Flash-Next GGUF has IQ2_S / IQ3_XXS /
-  IQ3_S / IQ4_NL / IQ4_XS experts. The kt-kernel side patches of this serve
-  (a lend-aware GPU output, a faster GGUF header read, a no-copy expert load)
-  are listed in `patches/` of this repo as they get the same treatment.
+  IQ3_S / IQ4_NL / IQ4_XS experts. `../kt-kernel/` has the CPU side as two
+  patches on upstream kt-kernel and its vendored ggml, the same way.
 - the model: the GGUF, a config directory for it (`config.json` with
   `quantization_config.quant_method: gguf` and the tokenizer files), and for
   MTP a draft directory (Strata's MTP GGUF laid out as a one-layer draft
