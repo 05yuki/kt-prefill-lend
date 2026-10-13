@@ -53,9 +53,10 @@ def plan(host, model, a):
     lm_head = b.get("lm_head", {}).get("bytes", 0) / tp
     embed = 0 if a.embed_host else model["embed_bytes"] / tp
     draft = a.draft_bytes if a.draft_bytes is not None else (model["draft_bytes"] / tp or (0.84 * GiB if c["mtp_layers"] else 0))
-    if model["draft_bytes"] == 0 and c["mtp_layers"]:
-        notes.append("draft bytes not in this checkpoint: 0.84 GiB assumed (the Flash-Next draft dir, Q2_0 experts)")
-    kv_tok = (c.get("kv_bytes_per_token_bf16") or 0) / tp
+    if a.draft_bytes is None and model["draft_bytes"] == 0 and c["mtp_layers"]:
+        notes.append("draft bytes not in this checkpoint: 0.84 GiB assumed (the Flash-Next draft dir, Q2_0 experts); --draft-bytes 0 if no draft is served")
+    # MLA keeps the whole compressed KV on every rank; head-sharded KV splits by tp
+    kv_tok = (c.get("kv_bytes_per_token_bf16") or 0) / (1 if c.get("kv_layout") == "mla" else tp)
     if a.kv_dtype == "fp8":
         kv_tok /= 2
     kv = a.context * kv_tok
@@ -137,6 +138,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
     ap.add_argument("--gguf")
+    ap.add_argument("--experts-from")
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--context", type=int, default=65536)
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8"], default="bf16")
@@ -150,7 +152,8 @@ def main():
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
     host = load([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json"], a.host_json)
-    mcmd = [sys.executable, os.path.join(HERE, "modelprobe.py"), a.model_dir, "--json"] + (["--gguf", a.gguf] if a.gguf else [])
+    mcmd = [sys.executable, os.path.join(HERE, "modelprobe.py"), a.model_dir, "--json"] + (["--gguf", a.gguf] if a.gguf else []) \
+        + (["--experts-from", a.experts_from] if a.experts_from else [])
     model = load(mcmd, a.model_json)
     p = plan(host, model, a)
     if a.env:

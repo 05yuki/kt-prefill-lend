@@ -161,12 +161,31 @@ def config_summary(cfg):
         "quant_method": q.get("quant_method"), "dtype": cfg.get("dtype") or cfg.get("torch_dtype"),
         "tie_word_embeddings": cfg.get("tie_word_embeddings"),
     }
-    # KV bytes per token at bf16 (the launcher's pool arithmetic; halve for fp8), linear-attention state per sequence
-    out["kv_bytes_per_token_bf16"] = full * 2 * n_kv * head_dim * 2 if n_kv and head_dim else None
+    # KV bytes per token at bf16 (the launcher's pool arithmetic; halve for fp8): MLA keeps one compressed vector
+    # per token and layer (kv_lora_rank + the rope part), everything else keeps K and V per kv head
+    lac = t.get("linear_attn_config") or {}
+    if lac.get("full_attn_layers"):
+        full = len(lac["full_attn_layers"])
+        out["full_attention_layers"] = full
+    if t.get("kv_lora_rank"):
+        out["kv_layout"] = "mla"
+        out["kv_bytes_per_token_bf16"] = full * (t["kv_lora_rank"] + (t.get("qk_rope_head_dim") or 0)) * 2
+    else:
+        out["kv_layout"] = "mha"
+        out["kv_bytes_per_token_bf16"] = full * 2 * n_kv * head_dim * 2 if n_kv and head_dim else None
+    # linear-attention state per sequence: GDN (Qwen3-Next style) or KDA (GLM-5.3 style)
     if t.get("linear_num_value_heads"):
         vh, vd, kd, conv = t["linear_num_value_heads"], t["linear_value_head_dim"], t.get("linear_key_head_dim", 0), t.get("linear_conv_kernel_dim", 4)
         lin = kinds.get("linear_attention", 0)
         out["linear_state_bytes_per_seq_bf16"] = lin * (vh * vd * kd * 2 + (vh * vd + 2 * t.get("linear_num_key_heads", 0) * kd) * (conv - 1) * 2)
+    elif lac.get("kda_layers"):
+        h, d, conv = lac["num_heads"], lac["head_dim"], lac.get("short_conv_kernel_size", 4)
+        lin = len(lac["kda_layers"])
+        out["layer_kinds"] = {"linear_attention": lin, "full_attention": full}
+        out["linear_state_bytes_per_seq_bf16"] = lin * (h * d * d * 2 + 3 * h * d * (conv - 1) * 2)
+    if t.get("index_topk"):
+        out["indexer"] = {"topk": t["index_topk"], "head_dim": t.get("index_head_dim"), "n_heads": t.get("index_n_heads"),
+                          "note": "the DSA indexer keeps its own compressed K pool per token, not counted here"}
     return out
 
 
@@ -235,7 +254,7 @@ def table(r):
     if c["num_experts"]:
         lines.append(f"experts {c['num_experts']} top-{c['experts_per_tok']}, moe intermediate {c['moe_intermediate_size']}, shared {c['shared_expert_intermediate_size']}")
     if c.get("kv_bytes_per_token_bf16"):
-        lines.append(f"KV {c['kv_bytes_per_token_bf16'] / 1024:.1f} KiB per token (bf16, {c['full_attention_layers']} full-attention layers)" +
+        lines.append(f"KV {c['kv_bytes_per_token_bf16'] / 1024:.1f} KiB per token (bf16, {c['kv_layout']}, {c['full_attention_layers']} full-attention layers)" +
                      (f"; linear-attention state {c['linear_state_bytes_per_seq_bf16'] / 2**20:.1f} MiB per sequence" if c.get("linear_state_bytes_per_seq_bf16") else ""))
     for b, d in sorted(r["buckets"].items(), key=lambda kv: -kv[1]["bytes"]):
         types = ", ".join(f"{t} {gb(n)}" for t, n in sorted(d["types"].items(), key=lambda kv: -kv[1])[:4])
@@ -252,9 +271,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
     ap.add_argument("--gguf")
+    ap.add_argument("--experts-from", help="a second checkpoint dir whose expert tensors are served (e.g. NVFP4 experts next to an fp8 dense checkpoint)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
     r = probe(a.model_dir, a.gguf)
+    if a.experts_from:
+        e = probe(a.experts_from)
+        r["experts"] = e.get("experts")
+        r["buckets"]["experts"] = e["buckets"].get("experts", {"bytes": 0, "tensors": 0, "types": {}})
+        r["experts_dir"] = a.experts_from
     print(json.dumps(r, indent=1) if a.json else table(r))
 
 
