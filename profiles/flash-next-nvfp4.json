@@ -1,13 +1,11 @@
 {
   "name": "flash-next-nvfp4",
-  "description": "Qwen3.8-Flash-Next from an NVFP4 checkpoint (NVIDIA's, or an in-house NVFP4 of an abliterated model): KT NVFP4 CPU experts, a static hot-expert placement, the NVFP4 streamer edition with the lend, the bf16 hc mix (the int8 mix with the prefill-only lend is a GGUF-stack default, not measured here), the token table in host memory, two-step MTP from the bf16 draft dir with fp8-padded experts. TP2 as measured (decode ~58, 38K prefill ~4,150 t/s).",
-  "tree": "sglang-v0.5.19 + trees/flash-next-gguf (the same one patch; this profile uses its NVFP4 paths)",
+  "description": "Flash-Next NVFP4 (ModelOpt) checkpoint, experts in RAM, captured from the in-house launcher (tools/start-qwen38-next-nvidia-v0519.sh, 2026-10-13, pid 216873): the NEXTN draft with no draft path reads the target checkpoint (2.95 GB, 69 s); at hot 32 + draft under 0.85 the pool came out 37,248 tokens, not the 262,144 context",
   "weights": {
     "gguf": false,
     "experts_from": false,
-    "embed_host": 1,
-    "draft": "safetensors",
-    "draft_bytes_assumed": 2.6
+    "embed_host": 0,
+    "draft": "self"
   },
   "defaults": {
     "2": {
@@ -16,8 +14,10 @@
       "kv_dtype": "bf16",
       "mamba_slots": 32,
       "pools": 2,
+      "hot": 32,
       "chunk": 16384,
-      "note": "chunk 16384 from the lend's calibration (10-05); hot from the plan with the constants of the 10-07 launch (hot 32 without a draft at 0.85; with the two-step draft the plan gives ~11)"
+      "threads": 60,
+      "note": "captured 10-13 from the in-house launcher; with hot 32 and the draft at 0.85 the pool is 37,248 (VRAM-bound), 49-50 tok/s on 1024-token warmups; hot 10 keeps the full 262,144 pool at 43 tok/s"
     }
   },
   "command": [
@@ -65,7 +65,7 @@
     "--max-mamba-cache-size",
     "{mamba_slots}",
     "--kt-weight-path",
-    "{experts_dir}",
+    "{config_dir}",
     "--kt-method",
     "NVFP4",
     "--kt-num-gpu-experts",
@@ -98,11 +98,35 @@
     "--reasoning-parser",
     "qwen3",
     "--watchdog-timeout",
-    "1800"
+    "1800",
+    "--warmups",
+    "kt_extend"
   ],
+  "env": {
+    "KT_CUTEDSL_CACHE": "{cache_dir}/cutedsl",
+    "KT_EXPERT_SHM": "1",
+    "KT_GPU_STREAM_DROP_CACHE": "{config_dir}",
+    "KT_GPU_STREAM_EARLY_INIT": "1",
+    "KT_GPU_STREAM_FIXED_ROWS": "1",
+    "KT_GPU_STREAM_GROUP": "64",
+    "KT_GPU_STREAM_PREFILL": "256",
+    "KT_GPU_STREAM_SCALE_BYTES": "1",
+    "KT_MXFP4_SCALE_CODES": "0",
+    "KT_PREFILL_LEND": "1",
+    "KT_PREFILL_LEND_HINT": "{cache_dir}/lend-hint-{key}",
+    "KT_STREAM_MEMOPS": "1",
+    "KT_TASKQUEUE_SPIN_US": "300",
+    "NCCL_IB_DISABLE": "1",
+    "NCCL_P2P_DISABLE": "1",
+    "NCCL_SHM_DISABLE": "0",
+    "SGLANG_HOST_STAGED_ALLREDUCE": "1",
+    "SGLANG_LL_ALLREDUCE": "1",
+    "SGLANG_NUMA_BIND_V2": "True"
+  },
+  "env_by_tp": {
+    "2": {}
+  },
   "command_with_draft": [
-    "--speculative-draft-model-path",
-    "{draft_dir}",
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
@@ -112,61 +136,30 @@
     "--speculative-num-draft-tokens",
     "3"
   ],
-  "command_with_placement": [
-    "--init-expert-location",
-    "{placement}"
-  ],
-  "env": {
-    "NCCL_P2P_DISABLE": "1",
-    "NCCL_IB_DISABLE": "1",
-    "SGLANG_NUMA_BIND_V2": "True",
-    "KT_EMBED_HOST": "1",
-    "KT_FAST_PINNED": "1",
-    "KT_CUTEDSL_CACHE": "{cache_dir}/cutedsl",
-    "KT_GPU_STREAM_PREFILL": "256",
-    "KT_GPU_STREAM_GROUP": "64",
-    "KT_GPU_STREAM_EARLY_INIT": "1",
-    "KT_GPU_STREAM_SCALE_BYTES": "1",
-    "KT_GPU_STREAM_FIXED_ROWS": "1",
-    "KT_GPU_STREAM_DROP_CACHE": "{config_dir}",
-    "KT_STREAM_MEMOPS": "1",
-    "KT_PREFILL_LEND": "1",
-    "KT_PREFILL_LEND_CALIBRATE": "0",
-    "KT_PREFILL_LEND_HINT": "{cache_dir}/lend-hint-{key}",
-    "KT_GPU_EXPERTS": "{hot}",
-    "KT_EXPERT_SHM": "1",
-    "KT_MXFP4_SCALE_CODES": "0",
-    "KT_TASKQUEUE_SPIN_US": "300",
-    "SGLANG_HOST_STAGED_ALLREDUCE": "1",
-    "SGLANG_LL_ALLREDUCE": "1",
-    "KT_HC_FP8": "0"
-  },
-  "env_by_tp": {
-    "2": {}
-  },
   "env_with_draft": {
     "KT_NEXT_MTP_PAD_FP8": "1",
     "KT_NEXT_MTP_GPU_ONLY": "1"
   },
-  "env_with_draft_hot": {
-    "KT_DRAFT_HOT": "{draft_hot}"
-  },
+  "command_with_placement": [
+    "--init-expert-location",
+    "{placement}"
+  ],
   "constants": {
     "weights_fixed": 6380650414.08,
-    "kv_bytes_per_token": 12288.0,
+    "kv_bytes_per_token": 13260.342542955326,
     "kv_dtype": "bf16",
     "states_bytes": 966367641.6,
     "states_slots": 32,
-    "overhead": 1839065989.119999,
-    "graphs": 579820584.96,
-    "overhead_is_upper_bound": true,
+    "overhead": 4566370222.079999,
+    "graphs": 998579896.3199999,
+    "overhead_is_upper_bound": false,
+    "includes_draft": true,
     "from": {
-      "log": "logs/qwen38-next-nvidia-v0519/20261007-130652/server.log",
+      "log": "in-house launch 2026-10-13 18:05 (server.log)",
       "hot": 32,
       "mem_fraction": 0.85,
-      "pool_tokens": 262144,
-      "avail_after_pool_gb": 2.7
-    },
-    "includes_draft": false
+      "pool_tokens": 37248,
+      "avail_after_pool_gb": 2.41
+    }
   }
 }
