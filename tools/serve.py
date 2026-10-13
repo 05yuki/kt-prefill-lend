@@ -186,6 +186,11 @@ def main():
                 "PATH": os.path.join(a.venv, "bin") + os.pathsep + os.path.join(cuda_home, "bin") + os.pathsep + env.get("PATH", ""),
                 "PYTHONPATH": os.path.join(a.tree, "python") + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
                 "PYTHONUNBUFFERED": "1", "OMP_NUM_THREADS": str(threads)})
+    # JIT builds at serve time (sgl-kernel / flashinfer modules compiled on first use) need the same glibc
+    # compat header as the install on a glibc 2.41+ host with CUDA 13 (install.sh sets it for the build)
+    compat = os.path.join(HERE, "cuda13-glibc-compat.h")
+    if os.path.exists(compat) and "cuda13-glibc-compat" not in env.get("NVCC_PREPEND_FLAGS", ""):
+        env["NVCC_PREPEND_FLAGS"] = (env.get("NVCC_PREPEND_FLAGS", "") + f" -U_GNU_SOURCE -D_DEFAULT_SOURCE -include {compat}").strip()
     env.update(dict(zip(prof["env"].keys(), fill(prof["env"].values(), vals))))
     e_tp = prof.get("env_by_tp", {}).get(str(tp), {})
     env.update(dict(zip(e_tp.keys(), fill(e_tp.values(), vals))))
