@@ -11,6 +11,7 @@ Reads file headers only (no venv, no tensor data). GGUF types unknown to gguf-py
 import argparse
 import glob
 import json
+import re
 import os
 import struct
 import sys
@@ -118,8 +119,9 @@ def classify_hf(name, num_layers, mtp_layers=0):
         return "ple", None, m  # the per-layer token table (Flash-Next), host memory in the serve
     if m.startswith("mtp.") or ".mtp." in m:
         return "draft", None, m
-    if ".layers." in m:
-        l = int(m.split(".layers.")[1].split(".")[0])
+    lm = re.match(r"(?:.*\.)?layers\.(\d+)\.", m)  # "model.layers.N." or a bare "layers.N." (DeepSeek V4)
+    if lm:
+        l = int(lm.group(1))
         if l >= num_layers:
             return ("draft" if l < num_layers + max(1, mtp_layers) else "other"), l, m
         if ".experts." in m and "shared" not in m:
@@ -130,9 +132,10 @@ def classify_hf(name, num_layers, mtp_layers=0):
         if "hyper_connection" in m or ".hc_" in m:
             return "hc", l, m
         return "dense", l, m
-    if "embed_tokens" in m or "token_embd" in m:
+    head = m.split(".")[0] if "." in m else m
+    if "embed_tokens" in m or "token_embd" in m or head in ("embed", "embedding", "tok_embeddings", "wte"):
         return "embed", None, m
-    if "lm_head" in m:
+    if "lm_head" in m or head in ("head", "output", "lm_head_base"):
         return "lm_head", None, m
     if "per_layer" in m or "ple" in m.split(".")[-2:]:
         return "ple", None, m
@@ -179,6 +182,17 @@ def config_summary(cfg):
     if t.get("kv_lora_rank"):
         out["kv_layout"] = "mla"
         out["kv_bytes_per_token_bf16"] = full * (t["kv_lora_rank"] + (t.get("qk_rope_head_dim") or 0)) * 2
+    elif t.get("compress_ratios"):
+        # DeepSeek V4 style: one latent of head_dim (+ rope) per token and layer, compressed by the layer's ratio
+        # (0 = uncompressed); the sliding window adds a share on top. The serve sizes its own hybrid pools
+        # (full / swa / c4 / c128) from one "bytes per full token" figure; a calibration pins it
+        # (Vision 10-13, fp8: 6,383 B against this estimate's 5,760 + window share)
+        ratios = [max(1, int(r)) for r in t["compress_ratios"]]
+        lat = (t.get("head_dim") or head_dim or 0) + (t.get("qk_rope_head_dim") or 0)
+        out["kv_layout"] = "dsv4-compressed"
+        out["full_attention_layers"] = sum(1 for r in ratios if r == 1)
+        out["kv_bytes_per_token_bf16"] = int(sum(lat * 2 / r for r in ratios))
+        out["kv_window_bytes_bf16"] = len(ratios) * (t.get("sliding_window") or 0) * lat * 2
     elif kinds.get("sliding_attention"):
         # Gemma-style: sliding layers keep a window of KV (a constant), only the global layers grow with the context;
         # the global layers may have their own kv heads / head dim

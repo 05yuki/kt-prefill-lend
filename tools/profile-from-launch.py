@@ -20,7 +20,8 @@ import os
 import sys
 
 ENV_PREFIXES = ("KT_", "SGLANG_", "NCCL_", "TORCH_EXTENSIONS_DIR", "TORCHINDUCTOR_CACHE_DIR")
-SIZED = {"--tp": "tp", "--context-length": "context", "--max-total-tokens": "context", "--mem-fraction-static": "mem_fraction",
+SIZED = {"--tp": "tp", "--tp-size": "tp", "--tensor-parallel-size": "tp", "--context-length": "context_length",
+         "--max-total-tokens": "context", "--mem-fraction-static": "mem_fraction",
          "--chunked-prefill-size": "chunk", "--max-prefill-tokens": "chunk", "--kt-num-gpu-experts": "hot",
          "--kt-cpuinfer": "threads", "--kt-threadpool-count": "pools", "--max-mamba-cache-size": "mamba_slots",
          "--kv-cache-dtype": "kv_cache_dtype", "--port": "port", "--served-model-name": "served_model_name"}
@@ -89,8 +90,8 @@ def main():
     threads = env.get("OMP_NUM_THREADS")
     penv = {}
     for k, v in env.items():
-        if not k.startswith(ENV_PREFIXES):
-            continue
+        if not k.startswith(ENV_PREFIXES) or k.startswith("KT_LAUNCH_TIMING"):
+            continue  # the timing instrument is not part of the serve
         if k in ("KT_GPU_EXPERTS",):
             v = "{hot}"
         elif k == "KT_PREFILL_LEND_HINT":
@@ -107,11 +108,18 @@ def main():
             v = sub_paths(v)
         penv[k] = v
     tp = defaults.get("tp", "1")
-    d = {"context": int(defaults.get("context", 0)), "mem_fraction": float(defaults.get("mem_fraction", 0)),
+    # "context" is the pool the plan sizes the KV for (--max-total-tokens when given, else --context-length);
+    # a larger --context-length is kept apart as context_length (DeepSeek V4: 1M context over a 262K pool)
+    ctx_len = int(defaults.get("context_length", 0) or 0)
+    pool = int(defaults.get("context", 0) or 0) or ctx_len
+    if not defaults.get("context"):
+        command = ["{context}" if c == "{context_length}" else c for c in command]
+    d = {"context": pool, "mem_fraction": float(defaults.get("mem_fraction", 0)),
          "kv_dtype": "fp8" if defaults.get("kv_cache_dtype", "").startswith("fp8") else "bf16",
          "mamba_slots": int(defaults.get("mamba_slots", 8) or 8), "pools": int(defaults.get("pools", 1) or 1),
          "hot": int(defaults.get("hot", 0) or 0), "chunk": int(defaults.get("chunk", 0) or 0),
          "threads": int(threads) if threads else None,
+         **({"context_length": ctx_len} if ctx_len and ctx_len != pool else {}),
          "note": f"taken from a running launch on {os.uname().nodename} by profile-from-launch.py"}
     prof = {"name": a.name, "description": f"captured from a launch ({'pid ' + str(a.pid) if a.pid else a.command})",
             "weights": json.loads(a.weights), "defaults": {tp: d}, "command": command,

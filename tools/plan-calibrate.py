@@ -51,6 +51,17 @@ def parse(log):
                 seen.add((n, k, v))
                 total += float(k) + float(v)
             out["kv_gb"] = total
+    # DeepSeek V4 logs: the hybrid pools are sized from one "bytes per full token" figure
+    # ("DSV4 memory calculation: bytes_per_full_token=B ... full_token=N" then "DSV4 pool sizes: full=N, swa=..."):
+    # the last pool-sizes line is the pool the serve kept (the first is the uncapped capacity)
+    if out["kv_gb"] is None:
+        bpt = re.findall(r"bytes_per_full_token=([0-9.]+)", s)
+        pools = re.findall(r"DSV4 pool sizes: full=(\d+), swa=(\d+), c4=(\d+), c128=(\d+)", s)
+        if bpt and pools:
+            full, swa, c4, c128 = (int(x) for x in pools[-1])
+            out["pool_tokens"] = full
+            out["kv_gb"] = float(bpt[-1]) * full / 1e9
+            out["dsv4_pools"] = {"full": full, "swa": swa, "c4": c4, "c128": c128, "bytes_per_full_token": float(bpt[-1])}
     out["pool_capped"] = None  # set by main() when the pool equals the context
     return out
 
@@ -81,6 +92,7 @@ def main():
     c = {"weights_fixed": weights - hot_bytes, "kv_bytes_per_token": pool_bytes / p["pool_tokens"], "kv_dtype": a.kv_dtype,
          "states_bytes": states, "states_slots": p["mamba_slots"], "overhead": overhead, "graphs": (p["graphs_gb"] or 0) * GiB,
          "overhead_is_upper_bound": capped, "includes_draft": bool(p["had_draft"]),
+         **({"dsv4_pools": p["dsv4_pools"]} if p.get("dsv4_pools") else {}),
          "from": {"log": a.log, "hot": a.hot, "mem_fraction": a.mem_fraction, "pool_tokens": p["pool_tokens"],
                   "avail_after_pool_gb": p["avail_after_pool_gb"]}}
     print(f"weights {p['weights_gb']:.2f} GB of which hot {hot_bytes / GiB:.2f} GiB -> fixed {c['weights_fixed'] / GiB:.2f} GiB; "

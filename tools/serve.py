@@ -134,6 +134,8 @@ def main():
         raise SystemExit(f"{len(gpus)} GPUs, tp {tp}")
     d = prof["defaults"][str(tp)]
     context = a.context or d["context"]
+    # the model's --context-length when the profile keeps it apart from the pool (DeepSeek V4: 1M over a 262K pool)
+    context_length = max(context, d.get("context_length") or 0) if not a.context else context
     mem_fraction = a.mem_fraction or d["mem_fraction"]
     kv_dtype = a.kv_dtype or d["kv_dtype"]
     mamba_slots = a.mamba_slots or d["mamba_slots"]
@@ -167,7 +169,8 @@ def main():
     chunk = a.chunk or d.get("chunk") or plan["chunk"]
     threads = a.threads or d.get("threads") or plan["threads"]
     vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "tp": tp,
-            "numa_nodes": " ".join(str(g["numa_node"]) for g in ranks), "context": context, "mem_fraction": mem_fraction,
+            "numa_nodes": " ".join(str(g["numa_node"]) for g in ranks), "context": context, "context_length": context_length,
+            "mem_fraction": mem_fraction,
             "kv_cache_dtype": "fp8_e4m3" if kv_dtype == "fp8" else "bfloat16", "mamba_slots": mamba_slots, "hot": hot,
             "threads": threads, "pools": pools, "chunk": chunk, "cache_dir": a.cache_dir, "key": key,
             "hot_dynamic": "1" if hot else "0", "served_model_name": a.served_model_name or prof["name"],
