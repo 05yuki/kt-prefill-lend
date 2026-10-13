@@ -39,9 +39,27 @@ it would have without the lend.
 
 ## Ten minutes to try it
 
-Flash-Next from a GGUF: `trees/flash-next-gguf/` is the complete tree as one
-patch on upstream SGLang v0.5.19 (see its README); the steps below are for the
-other trees.
+Flash-Next from a GGUF, from nothing (the whole serve: the two patched trees,
+a venv with the measured versions, kt-kernel built for your CPU and GPU, the
+model directories, a sized launch):
+
+```sh
+tools/install.sh ~/kt-serve                                  # clone, patch, venv, build (10-20 min)
+tools/make-config-dir.py <HF dir> <gguf dir> ~/kt-serve/config      # config + tokenizer, quant_method gguf
+~/kt-serve/venv/bin/python tools/make-draft-dir.py <mtp gguf> <HF dir> ~/kt-serve/draft   # the MTP draft (optional)
+tools/serve.py --venv ~/kt-serve/venv --tree ~/kt-serve/sglang --config-dir ~/kt-serve/config \
+               --gguf <gguf dir> --draft-dir ~/kt-serve/draft --tp 1 --context 65536
+```
+
+`serve.py` probes the host (`hostprobe.py`), sizes the launch (`plan-launch.py`:
+hot experts per layer, chunk, threads, NUMA binding, printed with the
+arithmetic) and starts SGLang with the knobs the numbers in this README were
+measured with; `--dry-run` prints the command, `--hot` / `--chunk` /
+`--mem-fraction` override the plan, `--tp 2` takes both cards. The HF dir is
+the checkpoint's config and tokenizer (Qwen3.8-Flash-Next); the GGUF dir is
+Strata's IQ3_S set or any Flash-Next GGUF with expert types the CPU kernels
+have (`trees/kt-kernel/`). The steps below are for adding the lend to another
+tree.
 
 
 On a server you already run (the trees and the streamer are described under
