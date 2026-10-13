@@ -193,6 +193,17 @@ def config_summary(cfg):
         out["full_attention_layers"] = sum(1 for r in ratios if r == 1)
         out["kv_bytes_per_token_bf16"] = int(sum(lat * 2 / r for r in ratios))
         out["kv_window_bytes_bf16"] = len(ratios) * (t.get("sliding_window") or 0) * lat * 2
+    elif isinstance(t.get("hybrid_layer_pattern"), list) and t.get("sliding_window"):
+        # MiMo style: a 0/1 pattern per layer (0 = full attention, 1 = sliding window); the full layers grow
+        # with the context, the sliding layers keep a window (their own kv heads / head dim when given)
+        pat = [int(x) for x in t["hybrid_layer_pattern"]]
+        glob = sum(1 for x in pat if x == 0)
+        s_kv = t.get("swa_num_key_value_heads") or n_kv
+        s_dim = t.get("swa_head_dim") or head_dim
+        out["kv_layout"] = "gqa+swa"
+        out["full_attention_layers"] = glob
+        out["kv_bytes_per_token_bf16"] = glob * 2 * n_kv * head_dim * 2
+        out["kv_window_bytes_bf16"] = (len(pat) - glob) * int(t["sliding_window"]) * 2 * s_kv * s_dim * 2
     elif kinds.get("sliding_attention"):
         # Gemma-style: sliding layers keep a window of KV (a constant), only the global layers grow with the context;
         # the global layers may have their own kv heads / head dim
