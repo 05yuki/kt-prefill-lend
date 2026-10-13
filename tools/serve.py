@@ -146,8 +146,10 @@ def main():
         plan_cmd += ["--gguf", a.gguf]
     elif a.experts and w.get("experts_from"):
         plan_cmd += ["--experts-from", a.experts]
-    if w.get("draft") == "none":
+    if w.get("draft") == "none" or not a.draft_dir:
         plan_cmd += ["--draft-bytes", "0"]
+    elif w.get("draft_bytes_assumed"):
+        plan_cmd += ["--draft-bytes", str(int(w["draft_bytes_assumed"] * 2**30 / tp))]  # the draft dir's share per rank
     if prof.get("constants"):
         plan_cmd += ["--constants", pf]  # calibrated from a launch log (tools/plan-calibrate.py)
     plan = json.loads(sh(plan_cmd))

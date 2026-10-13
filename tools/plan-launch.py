@@ -71,7 +71,7 @@ def plan(host, model, a):
         kv = a.context * kv_tok
         lin = cal["states_bytes"] / max(1, cal.get("states_slots") or 1) * a.mamba_slots
         budget = vram * a.mem_fraction
-        fixed = cal["weights_fixed"] + kv + lin + cal["overhead"]
+        fixed = cal["weights_fixed"] + kv + lin + cal["overhead"] + (0 if cal.get("includes_draft") else draft)
         notes.append(f"constants from {os.path.basename(os.path.dirname(cal['from']['log']))}: fixed weights "
                      f"{cal['weights_fixed'] / GiB:.2f} GiB, {kv_tok / 1024:.2f} KiB a token, overhead {cal['overhead'] / GiB:.2f} GiB")
     else:
@@ -117,7 +117,7 @@ def plan(host, model, a):
         notes.append("GPUs in use: " + ", ".join(f"{u['name']}({u['pid']})" for u in busy))
     return {"tp": tp, "gpus": [g["uuid"] for g in ranks], "gpu_nodes": [g["numa_node"] for g in ranks],
             "vram_per_rank": vram, "mem_fraction": a.mem_fraction, "budget": budget,
-            "terms": ({"weights_fixed": cal["weights_fixed"], "kv_pool": kv, "linear_states": lin, "overhead": cal["overhead"]} if cal else
+            "terms": ({"weights_fixed": cal["weights_fixed"], "draft": 0 if cal.get("includes_draft") else draft, "kv_pool": kv, "linear_states": lin, "overhead": cal["overhead"]} if cal else
                       {"dense+hc": dense, "lm_head": lm_head, "token_table": embed, "draft": draft, "kv_pool": kv,
                        "linear_states": lin, "graphs": GRAPHS, "workspace": WORKSPACE, "cuda_context": CUDA_CONTEXT}),
             "pool_predicted_tokens": int((budget - fixed + kv - hot * slot * (e["moe_layers"] if e else 0)) / max(1, kv / max(1, a.context))) if cal else None,

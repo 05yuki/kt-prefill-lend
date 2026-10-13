@@ -16,9 +16,8 @@
       "kv_dtype": "bf16",
       "mamba_slots": 32,
       "pools": 2,
-      "hot": 32,
       "chunk": 16384,
-      "note": "hot 32 with the static placement JSON (--placement), chunk 16384 from the lend's calibration; measured 10-05/10-06"
+      "note": "chunk 16384 from the lend's calibration (10-05); hot from the plan with the constants of the 10-07 launch (hot 32 without a draft at 0.85; with the two-step draft the plan gives ~11)"
     }
   },
   "command": [
@@ -153,5 +152,23 @@
   },
   "env_with_draft_hot": {
     "KT_DRAFT_HOT": "{draft_hot}"
+  },
+  "constants": {
+    "weights_fixed": 6380650414.08,
+    "kv_bytes_per_token": 12288.0,
+    "kv_dtype": "bf16",
+    "states_bytes": 966367641.6,
+    "states_slots": 32,
+    "overhead": 1839065989.119999,
+    "graphs": 579820584.96,
+    "overhead_is_upper_bound": true,
+    "from": {
+      "log": "logs/qwen38-next-nvidia-v0519/20261007-130652/server.log",
+      "hot": 32,
+      "mem_fraction": 0.85,
+      "pool_tokens": 262144,
+      "avail_after_pool_gb": 2.7
+    },
+    "includes_draft": false
   }
 }

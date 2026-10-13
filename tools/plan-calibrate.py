@@ -36,13 +36,22 @@ def parse(log):
         "avail_after_pool_gb": g(r"Memory pool end\. avail mem=([0-9.]+) GB"),
         "graphs_gb": sum(float(x) for x in re.findall(r"Capture [^\n]*end\.[^\n]*mem usage=([0-9.]+) GB", s)) or None,
         "max_total_num_tokens": g(r"max_total_num_tokens=(\d+)", int),
+        "had_draft": "speculative_draft_model_path': '/" in s or "speculative_draft_model_path\": \"/" in s,
     }
-    # Flash-Next logs: K size / V size lines instead of one KV size
+    # Flash-Next logs: K size / V size lines (one per pool: the target's full-attention pool first, the draft's
+    # after; every rank prints its own, so take the lines of one rank: up to the first repeat of the pool size)
     if out["kv_gb"] is None:
         ks = re.findall(r"KV Cache is allocated\.[^\n]*#tokens: (\d+), K size: ([0-9.]+) GB, V size: ([0-9.]+) GB", s)
         if ks:
             out["pool_tokens"] = int(ks[0][0])
-            out["kv_gb"] = sum(float(k) + float(v) for _, k, v in ks)
+            seen, total = set(), 0.0
+            for n, k, v in ks:
+                if (n, k, v) in seen:
+                    break
+                seen.add((n, k, v))
+                total += float(k) + float(v)
+            out["kv_gb"] = total
+    out["pool_capped"] = None  # set by main() when the pool equals the context
     return out
 
 
@@ -55,6 +64,7 @@ def main():
     ap.add_argument("--vram-total", type=float, required=True, help="bytes of one card")
     ap.add_argument("--mem-fraction", type=float, required=True)
     ap.add_argument("--kv-dtype", default="bf16")
+    ap.add_argument("--context", type=int, help="the launch's context; when the pool equals it, the overhead is only an upper bound")
     ap.add_argument("--write")
     a = ap.parse_args()
     p = parse(a.log)
@@ -67,13 +77,15 @@ def main():
     pool_bytes = p["kv_gb"] * GiB
     budget = a.vram_total * a.mem_fraction
     overhead = budget - weights - states - pool_bytes
+    capped = a.context is not None and p["pool_tokens"] >= a.context
     c = {"weights_fixed": weights - hot_bytes, "kv_bytes_per_token": pool_bytes / p["pool_tokens"], "kv_dtype": a.kv_dtype,
          "states_bytes": states, "states_slots": p["mamba_slots"], "overhead": overhead, "graphs": (p["graphs_gb"] or 0) * GiB,
+         "overhead_is_upper_bound": capped, "includes_draft": bool(p["had_draft"]),
          "from": {"log": a.log, "hot": a.hot, "mem_fraction": a.mem_fraction, "pool_tokens": p["pool_tokens"],
                   "avail_after_pool_gb": p["avail_after_pool_gb"]}}
     print(f"weights {p['weights_gb']:.2f} GB of which hot {hot_bytes / GiB:.2f} GiB -> fixed {c['weights_fixed'] / GiB:.2f} GiB; "
           f"pool {p['pool_tokens']} tokens = {p['kv_gb']:.2f} GB -> {c['kv_bytes_per_token'] / 1024:.2f} KiB a token ({a.kv_dtype}); "
-          f"states {states / GiB:.2f} GiB ({p['mamba_slots']} slots); overhead {overhead / GiB:.2f} GiB; graphs {c['graphs'] / GiB:.2f} GiB")
+          f"states {states / GiB:.2f} GiB ({p['mamba_slots']} slots); overhead {overhead / GiB:.2f} GiB{' (upper bound: the pool was capped by the context)' if capped else ''}; graphs {c['graphs'] / GiB:.2f} GiB")
     if a.write:
         prof = json.load(open(a.write))
         prof["constants"] = c
