@@ -39,6 +39,11 @@ it would have without the lend.
 
 ## Ten minutes to try it
 
+Flash-Next from a GGUF: `trees/flash-next-gguf/` is the complete tree as one
+patch on upstream SGLang v0.5.19 (see its README); the steps below are for the
+other trees.
+
+
 On a server you already run (the trees and the streamer are described under
 [Who this is for](#who-this-is-for)):
 
@@ -384,8 +389,13 @@ zeroed). Two cards gain nothing from the lend (the pool's pages are the only
 free VRAM at one card, not at two), so it is on for one card and off for two
 in our launcher.
 
-Applying it, after the lend (each script takes the SGLang tree as its argument;
-the modules are copied from `hot/` into `python/sglang/srt/layers/moe/`):
+For Flash-Next, do not apply these one by one: `trees/flash-next-gguf/`
+holds the whole serving tree as one patch on upstream `release/v0.5.19`
+(the streamer, both editions, the lend, the cache, the KV lend, the GGUF
+loader), which is how the numbers above were measured. The scripts below are
+for wiring the cache into another tree that already runs the KT wrapper with
+GGUF experts and the lend; each takes the SGLang tree as its argument and
+copies the modules from `hot/` into `python/sglang/srt/layers/moe/`:
 
 ```
 python hot/sglang-kt-gguf-hot.py   <sglang tree>   # the GPU hot-expert method for GGUF experts
