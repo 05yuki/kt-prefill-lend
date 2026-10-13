@@ -61,8 +61,22 @@ def plan(host, model, a):
         kv_tok /= 2
     kv = a.context * kv_tok
     lin = (c.get("linear_state_bytes_per_seq_bf16") or 0) / tp * a.mamba_slots
-    budget = vram * a.mem_fraction - CUDA_CONTEXT
-    fixed = dense + lm_head + embed + draft + kv + lin + GRAPHS + WORKSPACE
+    cal = a.constants_dict
+    if cal:
+        # constants calibrated from a launch log of this profile (tools/plan-calibrate.py): the measured fixed
+        # weights (dense, hc, lm_head, token table, draft as that launch had them), the real bytes a token takes
+        # (index pools included), the states, and what the server keeps beside the pool
+        kv_scale = 1.0 if cal.get("kv_dtype", "bf16") == a.kv_dtype else (0.5 if a.kv_dtype == "fp8" else 2.0)
+        kv_tok = cal["kv_bytes_per_token"] * kv_scale
+        kv = a.context * kv_tok
+        lin = cal["states_bytes"] / max(1, cal.get("states_slots") or 1) * a.mamba_slots
+        budget = vram * a.mem_fraction
+        fixed = cal["weights_fixed"] + kv + lin + cal["overhead"]
+        notes.append(f"constants from {os.path.basename(os.path.dirname(cal['from']['log']))}: fixed weights "
+                     f"{cal['weights_fixed'] / GiB:.2f} GiB, {kv_tok / 1024:.2f} KiB a token, overhead {cal['overhead'] / GiB:.2f} GiB")
+    else:
+        budget = vram * a.mem_fraction - CUDA_CONTEXT
+        fixed = dense + lm_head + embed + draft + kv + lin + GRAPHS + WORKSPACE
     left = budget - fixed
     e = model.get("experts")
     hot = 0
@@ -103,9 +117,11 @@ def plan(host, model, a):
         notes.append("GPUs in use: " + ", ".join(f"{u['name']}({u['pid']})" for u in busy))
     return {"tp": tp, "gpus": [g["uuid"] for g in ranks], "gpu_nodes": [g["numa_node"] for g in ranks],
             "vram_per_rank": vram, "mem_fraction": a.mem_fraction, "budget": budget,
-            "terms": {"dense+hc": dense, "lm_head": lm_head, "token_table": embed, "draft": draft, "kv_pool": kv,
-                      "linear_states": lin, "graphs": GRAPHS, "workspace": WORKSPACE, "cuda_context": CUDA_CONTEXT},
-            "left_for_hot": left, "hot_experts_per_layer": hot, "lent_from_empty_pool": lent,
+            "terms": ({"weights_fixed": cal["weights_fixed"], "kv_pool": kv, "linear_states": lin, "overhead": cal["overhead"]} if cal else
+                      {"dense+hc": dense, "lm_head": lm_head, "token_table": embed, "draft": draft, "kv_pool": kv,
+                       "linear_states": lin, "graphs": GRAPHS, "workspace": WORKSPACE, "cuda_context": CUDA_CONTEXT}),
+            "pool_predicted_tokens": int((budget - fixed + kv - hot * slot * (e["moe_layers"] if e else 0)) / max(1, kv / max(1, a.context))) if cal else None,
+            "left_for_hot": left, "hot_experts_per_layer": hot, "lent_from_empty_pool": lent, "moe_layers": e["moe_layers"] if e else 0,
             "hot_fixed_with_kv_lend": max(0, hot - lent), "expert_slot_per_rank": slot,
             "context": a.context, "kv_dtype": a.kv_dtype, "mamba_slots": a.mamba_slots, "chunk": chunk,
             "cpu_pools": pools, "threads": threads, "ram_need_experts_ple": ram_need, "notes": notes}
@@ -118,7 +134,8 @@ def table(p):
         lines.append(f"  {k:14s} {g(v)}")
     lines.append(f"  left for hot  {g(p['left_for_hot'])} -> {p['hot_experts_per_layer']} hot experts per layer (slot {p['expert_slot_per_rank'] / 2**20:.2f} MiB per rank); "
                  f"with KT_HOT_KV_LEND the empty pool lends ~{p['lent_from_empty_pool']} more, so KT_GPU_EXPERTS={p['hot_fixed_with_kv_lend']} then")
-    lines.append(f"context {p['context']} ({p['kv_dtype']} KV, pool = context), mamba slots {p['mamba_slots']}, prefill chunk {p['chunk']}")
+    lines.append(f"context {p['context']} ({p['kv_dtype']} KV, pool = context), mamba slots {p['mamba_slots']}, prefill chunk {p['chunk']}"
+                 + (f"; pool predicted at this hot: {p['pool_predicted_tokens']} tokens" if p.get("pool_predicted_tokens") else ""))
     lines.append("cpu pools: " + ", ".join(f"node {q['node']} x {q['threads']} threads (free {q['ram_free'] / GiB:.0f} GiB, page cache {q['page_cache'] / GiB:.0f})" for q in p["cpu_pools"])
                  + f"; experts + PLE in RAM {g(p['ram_need_experts_ple'])}")
     for n in p["notes"]:
@@ -149,8 +166,13 @@ def main():
     ap.add_argument("--host-json")
     ap.add_argument("--model-json")
     ap.add_argument("--env", action="store_true")
+    ap.add_argument("--constants", help="a profile JSON with \"constants\" from plan-calibrate.py, or a JSON of the constants")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
+    a.constants_dict = None
+    if a.constants:
+        cj = json.load(open(a.constants))
+        a.constants_dict = cj.get("constants", cj)
     host = load([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json"], a.host_json)
     mcmd = [sys.executable, os.path.join(HERE, "modelprobe.py"), a.model_dir, "--json"] + (["--gguf", a.gguf] if a.gguf else []) \
         + (["--experts-from", a.experts_from] if a.experts_from else [])

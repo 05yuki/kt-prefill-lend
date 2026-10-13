@@ -35,6 +35,28 @@ def sh(cmd, **kw):
     return r.stdout
 
 
+def wait_for_pool(log_path, proc, timeout=1800):
+    """The pool the server sized (max_total_num_tokens=N in its log), or None if it died / timed out."""
+    import re
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if os.path.exists(log_path):
+            with open(log_path, "rb") as f:
+                m = re.search(rb"max_total_num_tokens=(\d+)", f.read())
+            if m:
+                return int(m.group(1))
+        if proc.poll() is not None:
+            return None
+        time.sleep(3)
+    return None
+
+
+def model_layers(config_dir):
+    c = json.load(open(os.path.join(config_dir, "config.json")))
+    t = c.get("text_config", c)
+    return int(t.get("num_hidden_layers") or 1)
+
+
 def fill(items, vals):
     out = []
     for it in items:
@@ -72,6 +94,9 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE, overrides any default")
     ap.add_argument("--background", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="launch, read the pool the server sized (max_total_num_tokens); if it is short of the context, "
+                         "turn the shortfall into hot experts, remember the correction for this profile and key, and relaunch")
     a = ap.parse_args()
 
     pf = a.profile if a.profile.endswith(".json") else os.path.join(PROFILES, a.profile + ".json")
@@ -123,17 +148,22 @@ def main():
         plan_cmd += ["--experts-from", a.experts]
     if w.get("draft") == "none":
         plan_cmd += ["--draft-bytes", "0"]
+    if prof.get("constants"):
+        plan_cmd += ["--constants", pf]  # calibrated from a launch log (tools/plan-calibrate.py)
     plan = json.loads(sh(plan_cmd))
     kv_lend = prof.get("env_by_tp", {}).get(str(tp), {}).get("KT_HOT_KV_LEND") == "1"
+    key = f"tp{tp}-ctx{context}-mamba{mamba_slots}-{os.path.basename(experts_dir.rstrip('/'))}"
+    corr_path = os.path.join(a.cache_dir, "plan-corrections", f"{prof['name']}-{key}.json")
+    corr = json.load(open(corr_path)) if os.path.exists(corr_path) else {}
     if a.hot is not None:
         hot = a.hot
     elif "hot" in d:
         hot = d["hot"]  # the profile's measured value; the plan is printed beside it
     else:
         hot = plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"]
+        hot = max(0, hot + corr.get("hot_delta", 0))  # learned from an earlier launch's pool (see --calibrate)
     chunk = a.chunk or d.get("chunk") or plan["chunk"]
     threads = a.threads or plan["threads"]
-    key = f"tp{tp}-ctx{context}-mamba{mamba_slots}-{os.path.basename(experts_dir.rstrip('/'))}"
     vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "tp": tp,
             "numa_nodes": " ".join(str(g["numa_node"]) for g in ranks), "context": context, "mem_fraction": mem_fraction,
             "kv_cache_dtype": "fp8_e4m3" if kv_dtype == "fp8" else "bfloat16", "mamba_slots": mamba_slots, "hot": hot,
@@ -193,6 +223,26 @@ def main():
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
     with open(os.path.join(run, "server.pid"), "w") as f:
         f.write(str(proc.pid))
+    if a.calibrate:
+        pool = wait_for_pool(os.path.join(run, "server.log"), proc)
+        if pool is None:
+            print("calibrate: the server did not report a pool (see the log)")
+            return 1
+        kv_tok = plan["terms"]["kv_pool"] / max(1, context)
+        slot = plan["expert_slot_per_rank"] * (plan.get("moe_layers") or model_layers(a.config_dir))
+        short = context - pool
+        delta = -int(-(-short * kv_tok // slot)) if short > 0 else 0  # slots a layer the shortfall is worth, rounded up
+        print(f"calibrate: pool {pool} against context {context}: {'short by ' + str(short) + ' tokens' if short > 0 else 'enough'}"
+              f" -> hot delta {delta} (this launch used hot {hot})")
+        os.makedirs(os.path.dirname(corr_path), exist_ok=True)
+        with open(corr_path, "w") as f:
+            json.dump({"hot_delta": corr.get("hot_delta", 0) + delta, "pool": pool, "hot": hot, "context": context}, f)
+        if delta:
+            proc.terminate()
+            proc.wait(timeout=120)
+            print(f"calibrate: relaunching with hot {hot + delta} (correction saved to {corr_path})")
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + [x for x in sys.argv[1:] if x != "--calibrate"])
+        print("calibrate: the plan holds; correction saved")
     if a.background:
         print(f"started pid {proc.pid}")
         print(f"tail the log for 'max_total_num_tokens=': the pool the server sized against context {context}")

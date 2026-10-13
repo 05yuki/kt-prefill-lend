@@ -12,12 +12,10 @@
   "defaults": {
     "2": {
       "context": 131072,
-      "mem_fraction": 0.82,
+      "mem_fraction": 0.88,
       "kv_dtype": "fp8",
-      "mamba_slots": 8,
-      "pools": 2,
-      "hot": 10,
-      "note": "hot 10 measured (pool 85,248 at 131K context, fp8 KV); the plan's 11 left 34,880: GLM's fixed VRAM (DSA indexer pool, full-GPU prefill workspace) is ~0.5 GiB above the planner's Flash-Next constants"
+      "mamba_slots": 1,
+      "pools": 2
     }
   },
   "command": [
@@ -99,5 +97,21 @@
   },
   "env_by_tp": {
     "2": {}
+  },
+  "constants": {
+    "weights_fixed": 9579326442.56,
+    "kv_bytes_per_token": 7106.000168218684,
+    "kv_dtype": "fp8",
+    "states_bytes": 139586437.12,
+    "states_slots": 1,
+    "overhead": 837938053.1200001,
+    "graphs": 193273528.32,
+    "from": {
+      "log": "logs/glm53-flash/20261012 (the launcher's hot 10 / 0.88 / 131K launch)",
+      "hot": 10,
+      "mem_fraction": 0.88,
+      "pool_tokens": 213056,
+      "avail_after_pool_gb": 1.79
+    }
   }
 }
