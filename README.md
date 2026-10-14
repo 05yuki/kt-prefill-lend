@@ -314,6 +314,11 @@ full pool. The lend takes nothing from the KV pool by default:
   the chunk only lowers it.
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is refused by
   torch_memory_saver.
+- An extend below the streaming threshold runs with the weights back unless
+  its sequence reaches `KT_PREFILL_LEND_LONG_SEQ`: a prompt's last chunk, or a
+  short turn on a long conversation. The pool and the free memory are sized
+  for decode, so check such an extend on a new model: a prompt of two chunks
+  plus a ~160-token tail, and a few-token turn on a long conversation.
 - The Flash-Next tree's GPU expert path does not run with 0 hot experts (with
   or without the lend); use at least 1.
 
@@ -327,7 +332,12 @@ full pool. The lend takes nothing from the KV pool by default:
 - `KT_PREFILL_LEND_LONG_SEQ` — from this sequence length (65536) an extend
   below the streaming threshold still runs lent (a long prompt's last chunk
   makes prefix-sized buffers a card with its weights back has no room for),
-  and torch's cache is emptied before each chunk.
+  and torch's cache is emptied before each chunk. 65536 is sized for
+  DeepSeek V4.1, whose short extends only outgrow the card at prefixes near
+  1M. A model whose short extend is expensive needs it at the chunk: GLM-5.3
+  EXL3 on 16 GB cards runs 8192, because its EXL3 linears rebuild fp16
+  weights above 144 rows and the ~160-row tail of a 16.5K prompt ran out of
+  memory with the weights back.
 - `KT_PREFILL_LEND_IDLE` — parameter-name substrings lent but not brought
   back during a prefill, for weights the prefill never reads (GLM's hot
   experts; within 1%, so off by default). Turns `LONG_SEQ`'s first part off.
