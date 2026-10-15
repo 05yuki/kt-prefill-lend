@@ -346,7 +346,11 @@ full pool. The lend takes nothing from the KV pool by default:
   weight stays out of the decode spans (it is in the pinned mirror and in the
   prefill's layer slots, nowhere else), so decode gets its VRAM back. While
   decoding it is an empty tensor: the model must not read it then. Not
-  combinable with `IDLE`. See "The lend in reverse" below.
+  combinable with `IDLE`. A layer's span is made smaller at the end of the
+  load only when it holds 1 MiB or more of those weights; the bind's slack
+  alone never remakes it (a freed span stays in the pool's segment, and
+  remaking every layer's ran a rank out of memory). See "The lend in reverse"
+  below.
 - `KT_PREFILL_LEND_HINT` — where the measurement is written (set by
   `kt-lend-auto.sh`).
 - `KT_PREFILL_LEND_KV_CAP`, `KT_PREFILL_LEND_PROBE_CONTEXT`,

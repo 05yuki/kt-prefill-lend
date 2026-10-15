@@ -385,6 +385,11 @@ def _relayout(i: int, counts) -> None:
     STATE.setdefault("active", {})[i] = span if active is None else active
     dec = span if pfo is None else pfo
     STATE.setdefault("dec_end", {})[i] = dec
+    # prefill-only bytes the current span holds: only those come back by making
+    # a smaller one (bind_model leaves them out, so a layer the load did not lay
+    # out again holds none, and its span differs from dec by the bind's slack)
+    pf_held = sum(item[5] for item in new if item[0] == "param" and item[4] >= dec
+                  and lo <= layer.get_parameter(item[1]).data_ptr() < hi)
     # through pinned host memory, back into the same span (the bind left
     # room for the small parameters an owner may take in): freeing a span
     # and making a slightly larger one cut a new segment per layer on one
@@ -396,10 +401,14 @@ def _relayout(i: int, counts) -> None:
     _point(layer, host, new)
     STATE["dev_spans"][i] = None
     del found, src
-    # the decode span ends before the prefill-only weights; one that would keep
-    # 1 MiB or more of them is made anew so the memory goes back
-    shrink = dec < span and full.numel() - dec >= (1 << 20)
-    in_place = dec <= full.numel() and not shrink
+    # the decode span ends before the prefill-only weights; one that holds 1 MiB
+    # or more of them is made anew so the memory goes back. Not for the bind's
+    # slack: a span freed and made again does not go back to the driver (the
+    # pool keeps the segment), and 48 layers of that ran a rank out of memory
+    # with KT_PREFILL_LEND_PFONLY on a safetensors checkpoint
+    held = full.numel()
+    shrink = dec < span and pf_held >= (1 << 20)
+    in_place = dec <= held and not shrink
     if in_place:
         dspan = full[:dec]
     else:
@@ -412,7 +421,8 @@ def _relayout(i: int, counts) -> None:
         STATE["dev_full"][i] = dspan
         counts["grown"] += 1
     if DEBUG:
-        _log(f"relayout layer {i} on {device}: span {STATE['spans'][i]} -> {span} bytes "
+        _log(f"relayout layer {i} on {device}: span {STATE['spans'][i]} -> {span} bytes (decode {dec}, "
+             f"held {held}, prefill-only in it {pf_held}) "
              f"({'in place' if in_place else 'new span'}), free {torch.cuda.mem_get_info(device)[0] >> 20} MiB, "
              f"torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
     dspan.copy_(host[:dec])
