@@ -159,7 +159,7 @@ the same server without the lend.
 | GLM-5.3-Flash NVFP4 experts | 0 -> 10 | 2048 -> 14336 | 163 -> **326-327** | 155 -> **292** | 18.3 -> 19.9-20.1 | NLL z -0.35 / -1.04 |
 
 V4.1 keeps its whole 1,048,576-token KV pool and prefills a 989,154-token
-prompt to the end at chunk 6144 (2,433.9 s, the server's first prefill); see
+prompt to the end at chunk 6144 (406 tokens/s, the server's first prefill); see
 [Long prompts](#long-prompts).
 
 **One card or one socket**
@@ -359,17 +359,21 @@ its own buffer.
 **Results.** The same host, one launch each with and without the plan (`tools/serve.py
 --plan` is the same switch), a 35K-token prompt prefilled into an empty pool,
 a short turn on it, then a 35K prompt of other tokens with the first still
-cached. Seconds; decode in tokens/s:
+cached. Prefill and decode in tokens/s (the 35K prompts are 35,000 tokens):
 
-| Model | KV pool | 35K, empty pool | short turn on it | 35K again, the first cached | decode | quality vs without |
-|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next NVFP4 | 262,144 = | 7.39 -> **6.42** | 2.26 -> 2.08 | 7.24 -> 7.28 | 60.8 -> 66.1 | bit-identical |
-| Qwen3.5-35B-A3B bf16 | 262,144 = | 5.43 -> **4.28** | 6.72 -> 5.52 | 5.14 -> **3.94** | 99.7 -> 102.3 | bit-identical |
-| DeepSeek V4.1-Flash, 1M ctx | 1,027,072 -> 1,048,576 | 77.37 -> **58.07** | 60.08 -> 47.19 | 57.49 -> **44.49** | 29.5 -> 28.4 | NLL z +0.49 |
-| DeepSeek V4-Flash-Vision | 262,144 = | (first use) | 4.76 -> 4.77 | 41.70 -> 40.85 | 43.6 -> 42.6 | NLL z -0.07 |
-| MiMo-V2.6-Flash | 262,144 = | (first use) | 4.39 -> 4.52 | 18.28 -> 19.08 | 31.7 -> 32.1 | NLL z +0.90 |
-| GLM-5.3-Flash NVFP4 experts | 201,280 -> **217,408** | 109.39 -> 108.96 | 112.45 -> 111.89 | 108.73 -> 108.21 | 20.3 -> 20.4 | bit-identical |
-| Qwen3.8-Flash-Next GGUF (IQ3_S) | 262,144 = | (first use) | 1.44 -> 1.65 | 7.55 -> 7.97 | 89.6 -> 88.5 | bit-identical |
+| Model | KV pool | 35K, empty pool | 35K again, the first cached | decode | quality vs without |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next NVFP4 | 262,144 = | 4,736 -> **5,452** | 4,834 -> 4,808 | 60.8 -> 66.1 | bit-identical |
+| Qwen3.5-35B-A3B bf16 | 262,144 = | 6,446 -> **8,178** | 6,809 -> **8,883** | 99.7 -> 102.3 | bit-identical |
+| DeepSeek V4.1-Flash, 1M ctx | 1,027,072 -> 1,048,576 | 452 -> **603** | 609 -> **787** | 29.5 -> 28.4 | NLL z +0.49 |
+| DeepSeek V4-Flash-Vision | 262,144 = | (first use) | 839 -> 857 | 43.6 -> 42.6 | NLL z -0.07 |
+| MiMo-V2.6-Flash | 262,144 = | (first use) | 1,915 -> 1,834 | 31.7 -> 32.1 | NLL z +0.90 |
+| GLM-5.3-Flash NVFP4 experts | 201,280 -> **217,408** | 320 -> 321 | 322 -> 323 | 20.3 -> 20.4 | bit-identical |
+| Qwen3.8-Flash-Next GGUF (IQ3_S) | 262,144 = | (first use) | 4,636 -> 4,391 | 89.6 -> 88.5 | bit-identical |
+
+The short turn (200 tokens on the cached 35K, 64 out) is a whole-turn time, not
+a prefill rate: 2.26 -> 2.08 s, 6.72 -> 5.52, 60.08 -> 47.19, 4.76 -> 4.77,
+4.39 -> 4.52, 112.45 -> 111.89 and 1.44 -> 1.65 in the table's order.
 
 No run ran out of memory. The plan does not touch the decode path; decode moves from launch to launch on this host (its inlet temperature), Flash-Next's 60.8 included. *(first use)*: the streamer's one-time setup of the
 expert arenas (5-8 minutes on this host) fell into one side's first long
@@ -525,14 +529,15 @@ prefill. Flash-Next (GGUF, one MTP draft step with the GGUF release's own
 Q2_0 draft, two 16 GB cards, Japanese-fiction decode, 35K-token streamed
 prefill at chunk 16384; two launches each, interleaved):
 
-| | KV pool | prefill window free / peak | 35K prefill + 200 | decode, mean of 8 |
+| | KV pool | prefill window free / peak | 35K prompt + 200 out, prompt tok/s | decode, mean of 8 |
 |---|---|---|---|---|
-| no reverse lend, 64 hot experts | 121,152 | 8.90 / 6.83 GB | 11.3-11.4 s | 104.6-106.2 tok/s |
-| reverse lend, 64 hot (pool grows) | 131,072 | 8.41 / 6.85 GB | 11.2 s | 104.8 tok/s (one launch) |
-| reverse lend, 84 hot, pool held | 121,152 | 8.57 / 6.85 GB | 11.3-11.5 s | 107.0-109.5 tok/s |
-| the same + hot experts in the KV pool's free pages | 121,152 | 8.57 / 6.85 GB | 11.4 s | 110.8-111.9 tok/s |
+| no reverse lend, 64 hot experts | 121,152 | 8.90 / 6.83 GB | 3,070-3,097 | 104.6-106.2 tok/s |
+| reverse lend, 64 hot (pool grows) | 131,072 | 8.41 / 6.85 GB | 3,125 | 104.8 tok/s (one launch) |
+| reverse lend, 84 hot, pool held | 121,152 | 8.57 / 6.85 GB | 3,043-3,097 | 107.0-109.5 tok/s |
+| the same + hot experts in the KV pool's free pages | 121,152 | 8.57 / 6.85 GB | 3,070 | 110.8-111.9 tok/s |
 
-The last row is the KV lend of the next section: 18-19 more slots per layer
+The prompt rate there is 35,000 tokens over the whole request, the 200 output
+tokens' time included. The last row is the KV lend of the next section: 18-19 more slots per layer
 after the 35K, with the pool and the prefill window unchanged.
 
 ## Hot experts, and the KV pool's free pages
