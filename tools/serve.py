@@ -5,6 +5,7 @@ usage: serve.py --profile NAME --venv VENV --tree SGLANG_TREE --config-dir DIR [
                 [--draft-dir DIR] [--tp 1|2] [--context T] [--port 8080] [--hot N] [--mem-fraction F] [--chunk C]
                 [--kv-dtype bf16|fp8] [--mamba-slots N] [--threads N] [--placement FILE] [--hot-seed JSON]
                 [--draft-hot FILE] [--log-dir DIR] [--cache-dir DIR] [--env KEY=VALUE ...] [--background] [--dry-run]
+                [--plan [--plan-cap 36864]]
 
   --profile      profiles/<NAME>.json: the command line, the env defaults (per TP) and how the weights are laid out
                  (flash-next-gguf: everything from a GGUF; glm53-flash: fp8 dense + NVFP4 experts)
@@ -12,6 +13,9 @@ usage: serve.py --profile NAME --venv VENV --tree SGLANG_TREE --config-dir DIR [
   --gguf / --experts   where the experts are (a GGUF dir, or a second checkpoint dir); default: the config dir
   --draft-dir    the MTP draft directory when the profile serves one (tools/make-draft-dir.py)
   --hot / --mem-fraction / --chunk / --threads   override the plan (tools/plan-launch.py prints the arithmetic)
+  --plan         the prefill chunk planned per request over the KV pool's free pages (kv-vmm/; README, "The chunk
+                 per request"): the launch chunk becomes --plan-cap, the lend's own chunk the fallback; a setup's
+                 first launch runs the lend at its chunk and measures, the next ones plan
 The server log and a manifest (command, env, plan, package versions) go to --log-dir/<timestamp>/.
 """
 import argparse
@@ -94,6 +98,8 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE, overrides any default")
     ap.add_argument("--background", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--plan", action="store_true", help="plan the prefill chunk per request (kv-vmm/)")
+    ap.add_argument("--plan-cap", type=int, default=36864, help="the largest planned chunk (--plan)")
     ap.add_argument("--calibrate", action="store_true",
                     help="launch, read the pool the server sized (max_total_num_tokens); if it is short of the context, "
                          "turn the shortfall into hot experts, remember the correction for this profile and key, and relaunch")
@@ -168,6 +174,36 @@ def main():
         hot = max(0, hot + corr.get("hot_delta", 0))  # learned from an earlier launch's pool (see --calibrate)
     chunk = a.chunk or d.get("chunk") or plan["chunk"]
     threads = a.threads or d.get("threads") or plan["threads"]
+    plan_env, plan_note = {}, None
+    if a.plan:
+        # the planned setup's measurements are its own (the loans change what a window has)
+        key += "-plan"
+        lib = os.path.join(a.tree, "python", "sglang", "srt", "layers", "moe", "libkv_vmm.so")
+        if not os.path.exists(lib) and not os.environ.get("KT_KV_VMM_LIB"):
+            raise SystemExit(f"--plan: {lib} missing (kv-vmm/build.sh, then kv-vmm/sglang-kt-kv-vmm.py on the tree)")
+        safe = chunk
+        plan_env = {"KT_KV_VMM": "1", "KT_PREFILL_KV_LEND": "1", "KT_PREFILL_PLAN": "1",
+                    "KT_GPU_STREAM_ROW_BLOCK": "4096", "KT_PREFILL_PLAN_SAFE": str(safe),
+                    "KT_PREFILL_PLAN_MARGIN_MB": "128"}
+        hint = os.path.join(a.cache_dir, f"lend-hint-{key}")
+        got = sh([sys.executable, os.path.join(HERE, "kt-prefill-plan-constants.py"), hint, str(a.plan_cap)]).split()
+        if len(got) == 4:
+            free_mb, row_kb, cost, delta = got
+            plan_env.update({"KT_PREFILL_PLAN_FREE_MB": free_mb, "KT_PREFILL_PLAN_ROW_KB": row_kb})
+            if cost != "-":
+                plan_env["KT_PREFILL_PLAN_COST"] = cost
+            if delta != "0":
+                plan_env["KT_PREFILL_PLAN_DELTA_MB"] = delta
+            chunk = a.plan_cap
+            # a hybrid SWA model: its sliding-window pool must hold the cap; the part past
+            # the lend's chunk is lent outside prefill instead of taken from the KV budget
+            if any(x in ("--swa-full-tokens-ratio", "--swa-prefix-tails") for x in prof["command"]):
+                plan_env.update({"KT_PREFILL_SWA_LEND": "1",
+                                 "KT_PREFILL_SWA_TOKENS": str((a.plan_cap + 512) * 102 // 100)})
+            plan_note = f"prefill plan: cap {chunk}, the lend's chunk {safe} before a window has measured"
+        else:
+            plan_note = (f"prefill plan: no measurement of this setup yet; this launch runs the lend at chunk {chunk} "
+                         "with the KV loan and measures, the next one plans")
     vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "tp": tp,
             "numa_nodes": " ".join(str(g["numa_node"]) for g in ranks), "context": context, "context_length": context_length,
             "mem_fraction": mem_fraction,
@@ -192,6 +228,7 @@ def main():
     if os.path.exists(compat) and "cuda13-glibc-compat" not in env.get("NVCC_PREPEND_FLAGS", ""):
         env["NVCC_PREPEND_FLAGS"] = (env.get("NVCC_PREPEND_FLAGS", "") + f" -U_GNU_SOURCE -D_DEFAULT_SOURCE -include {compat}").strip()
     env.update(dict(zip(prof["env"].keys(), fill(prof["env"].values(), vals))))
+    env.update(plan_env)
     e_tp = prof.get("env_by_tp", {}).get(str(tp), {})
     env.update(dict(zip(e_tp.keys(), fill(e_tp.values(), vals))))
     for cond, block in (("draft_dir", "env_with_draft"), ("draft_hot", "env_with_draft_hot"), ("hot_seed", "env_with_hot_seed")):
@@ -223,7 +260,7 @@ def main():
         json.dump(manifest, f, indent=1)
     print(f"{prof['name']} tp {tp}: hot {hot} per layer (plan {plan['hot_experts_per_layer']}, lent ~{plan['lent_from_empty_pool']}), "
           f"chunk {chunk}, threads {threads} on nodes {[g['numa_node'] for g in ranks]}, context {context}, mem {mem_fraction}, KV {kv_dtype}")
-    for n in plan["notes"]:
+    for n in plan["notes"] + ([plan_note] if plan_note else []):
         print("! " + n)
     print("log directory:", run)
     if a.dry_run:

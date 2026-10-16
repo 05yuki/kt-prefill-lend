@@ -290,11 +290,143 @@ full pool. The lend takes nothing from the KV pool by default:
   batch comes in at 3072 rows; the launcher adds prefix tails to fill them
   only as far as the pool's slack pays (13 tails at 6144, budget 1,049,856
   for a cap of 1,048,576).
+- With the plan (next section) the SWA pool no longer sets the chunk: it is
+  budgeted at a small chunk and widened outside the KV budget, lent outside
+  prefill.
 - `kt_lend_swa_ratio` (ratio-sized SWA pools: V4-Flash, Vision, MiMo)
   computes the ratio from the cap. `KT_PREFILL_LEND_SWA_FIT=1` computes it
   from the full pool an earlier launch got instead, which trades KV for
   chunk: MiMo on one card goes from 12.1K- to 13.9K-row batches (40K prompts
   1,107 -> 1,331 tok/s) and from a 97,699- to an 81,552-token full pool.
+
+## The chunk per request: the KV pool's free pages and the plan
+
+The lend sizes one chunk at launch. With `--plan` (serve.py) or
+`kt_prefill_plan_setup` (kt-lend-auto.sh) the chunk is planned per request
+instead, and a prefill also borrows the KV pool's *free* pages. Four pieces,
+in `kv-vmm/` and `patches/`, none model-specific:
+
+- **The KV pool on remappable memory** (`KT_KV_VMM=1`, `kv_vmm.c`,
+  `kt_kv_vmm.py`). Every buffer SGLang makes in its `kv_cache` region is a
+  CUDA virtual-memory range of 8 MiB chunks (the device granularity for
+  buffers under 64 MiB) that can be unmapped and mapped again, zeroed, at the
+  same addresses, so the decode CUDA graphs that read it stay valid. On torch
+  2.13 the region is a `CUDAPluggableAllocator` MemPool; on older torch, whose
+  MemPool fails there, the region makes the tensors itself.
+- **The loan** (`KT_PREFILL_KV_LEND=1`, `kt_kv_prefill_lend.py`). When a
+  prefill window opens, the free pages beyond the request's remaining prompt
+  and 4,096 tokens leave the allocator's free list and every chunk holding only
+  such pages is unmapped; at the window's end they are mapped back, zeroed,
+  before the weights. The KV always wins: the pool keeps its size,
+  `available_size` counts the lent pages, and an allocation that needs them
+  maps them back first. A pool split into sub-pools by page (DeepSeek V4's
+  per-compress-ratio and indexer pools, whose pages line up with the full
+  pool's) lends through all of them.
+- **The plan** (`KT_PREFILL_PLAN=1`, `kt_prefill_plan.py`). The launch chunk
+  becomes a cap (`--plan-cap`, 36,864) and each request gets the fewest chunks
+  its uncached prompt needs, at the smallest equal size, from the free memory
+  every TP rank has now (a MIN all-reduce, so every rank plans the same) and a
+  cost per row fitted from the lend's per-forward records
+  (`tools/kt-prefill-plan-constants.py`; until enough are recorded, the lend's
+  own reserved bytes a row). Until a launch's first window has measured the
+  step from decode to a window, a request gets the lend's own chunk.
+- **Row blocks** (`KT_GPU_STREAM_ROW_BLOCK=4096`,
+  `patches/sglang-kt-stream-row-block.py` for the NVFP4 / GGUF streamers,
+  `patches/sglang-kt-stream-row-block-dsv41.py` for the DeepSeek V4 one). The
+  streamer's and the resident experts' CUTLASS MoE run over blocks of rows,
+  so its workspace is a block's, not the chunk's (it was 104-130 KB a row).
+
+A hybrid sliding-window model (MiMo, DeepSeek V4) must hold a whole chunk in
+its SWA pool, which on those models costs several full-pool tokens a slot.
+With the plan (`KT_PREFILL_SWA_LEND=1`, set for such profiles):
+
+- the pools are budgeted at a 2,048-token chunk; the SWA pool alone is widened
+  for the cap (and the DeepSeek V4 compress state that follows its pages), its
+  widened part made with nothing mapped;
+- outside prefill its free pages beyond 4,096 tokens are unmapped, and what a
+  prefix cache keeps beyond the pool the lend's own chunk would have had is
+  handed back through the cache's own eviction (`tree_cache.evict`);
+- SGLang's chunk-cache SWA eviction counts the chunk in flight as the one
+  planned for the request (`managers/schedule_batch.py`), so a request does
+  not hold every chunk's SWA until it ends.
+
+What SGLang itself sizes from the launch chunk is kept at the lend's chunk: the
+pools' budget, and KT's staging buffer for CPU experts
+(`patches/sglang-kt-staging-plan.py`, GLM-5.3's tree), which under the plan
+holds the batches under the GPU prefill threshold only and gives a larger one
+its own buffer.
+
+**Results.** The same host, one launch each with and without the plan (`tools/serve.py
+--plan` is the same switch), a 35K-token prompt prefilled into an empty pool,
+a short turn on it, then a 35K prompt of other tokens with the first still
+cached. Seconds; decode in tokens/s:
+
+| Model | KV pool | 35K, empty pool | short turn on it | 35K again, the first cached | decode | quality vs without |
+|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next NVFP4 | 262,144 = | 7.39 -> **6.42** | 2.26 -> 2.08 | 7.24 -> 7.28 | 60.8 -> 66.1 | bit-identical |
+| Qwen3.5-35B-A3B bf16 | 262,144 = | 5.43 -> **4.28** | 6.72 -> 5.52 | 5.14 -> **3.94** | 99.7 -> 102.3 | bit-identical |
+| DeepSeek V4.1-Flash, 1M ctx | 1,027,072 -> 1,048,576 | 77.37 -> **58.07** | 60.08 -> 47.19 | 57.49 -> **44.49** | 29.5 -> 28.4 | NLL z +0.49 |
+| DeepSeek V4-Flash-Vision | 262,144 = | (first use) | 4.76 -> 4.77 | 41.70 -> 40.85 | 43.6 -> 42.6 | NLL z -0.07 |
+| MiMo-V2.6-Flash | 262,144 = | (first use) | 4.39 -> 4.52 | 18.28 -> 19.08 | 31.7 -> 32.1 | NLL z +0.90 |
+| GLM-5.3-Flash NVFP4 experts | 201,280 -> **217,408** | 109.39 -> 108.96 | 112.45 -> 111.89 | 108.73 -> 108.21 | 20.3 -> 20.4 | bit-identical |
+| Qwen3.8-Flash-Next GGUF (IQ3_S) | 262,144 = | (first use) | 1.44 -> 1.65 | 7.55 -> 7.97 | 89.6 -> 88.5 | bit-identical |
+
+No run ran out of memory. The plan does not touch the decode path; decode moves from launch to launch on this host (its inlet temperature), Flash-Next's 60.8 included. *(first use)*: the streamer's one-time setup of the
+expert arenas (5-8 minutes on this host) fell into one side's first long
+prompt. Where the chunk count drops the prefill gets faster (Flash-Next 2 -> 1
+chunks on an empty pool, Qwen3.5 2 -> 1, V4.1 6 -> 3 and 6 -> 4 again); with a prompt already
+cached there are fewer free pages to borrow and the plan takes more chunks
+(Flash-Next's second 35K: 2 chunks again). Vision, MiMo and GLM keep their
+chunk count at 35K (their prefill costs 290-520 KB a row reserved, and Vision
+and MiMo also need the prompt's SWA mapped). GLM's pool grows because its
+staging buffer no longer follows the launch chunk. V4.1's pool without the
+plan is 1,027,072 here because its launcher's prefix-tail count read the
+previous launch's log.
+
+**The pages in use stay as they were.** `KT_PREFILL_KV_LEND_VERIFY=1` hashes
+every page in use when a window lends (not the window's own batch's) and again
+after it is mapped back; `KT_PREFILL_KV_LEND_FORCE=1` makes every window lend.
+`tools/kv-lend-cache-check.py` fills the pool with cached prompts around
+lending windows (seven 24K-token prompts in a 262K pool):
+
+| model | pages in use when a window lent (most) | changed |
+|---|---|---|
+| Qwen3.8-Flash-Next NVFP4 | 3,747 of 4,096 (64 tokens each) | 0 in 41 windows |
+| MiMo-V2.6-Flash | 204,884 of 262,144 (1 token) | 0 in 9 windows |
+| DeepSeek V4-Flash-Vision | 794 of 1,024 (256 tokens) | 0 in 9 windows |
+
+V4.1, Qwen3.5 and GLM-5.3 have no prefix cache in these setups, so nothing else
+is in their pool when a window lends; their NLL is the check. Comparing cached
+continuations does not judge this on every model: Qwen3.8-Flash-Next's cached
+path gives a different continuation each time the same prompt is read, with
+the plan off as well (a known issue of its prefix cache, not of the lend).
+
+**Applying it.** Build the library (`kv-vmm/build.sh`), then on the patched
+tree `python kv-vmm/sglang-kt-kv-vmm.py <sglang tree>` (the modules and the
+library into `layers/moe/`, the `kv_cache` region, the scheduler's chunk and
+prompt-length hooks, and where the tree has them the KV cache configurator's
+SWA hunks and the chunk-cache SWA eviction), the row-block patch for its
+streamer, and on GLM-5.3's tree `patches/sglang-kt-staging-plan.py`. Then
+`tools/serve.py ... --plan`, or in a launcher, after `kt_lend_auto`:
+
+```bash
+kt_prefill_plan_setup        # "swa" as its argument for a hybrid SWA model
+# ... --chunked-prefill-size "$KT_LEND_CHUNK"
+```
+
+A setup's first launch has no measurement yet: it runs the lend at its chunk
+with the loan, and records; the next one plans.
+
+**Knobs.** `KT_KV_VMM`, `KT_PREFILL_KV_LEND`, `KT_PREFILL_PLAN`,
+`KT_PREFILL_SWA_LEND` (on); `KT_PREFILL_PLAN_CAP` (36,864),
+`KT_PREFILL_PLAN_SAFE` (the lend's chunk), `KT_PREFILL_PLAN_MARGIN_MB` (128),
+`KT_PREFILL_PLAN_COST` / `_ROW_KB` / `_FREE_MB` / `_DELTA_MB` (from the
+records); `KT_PREFILL_KV_LEND_RESERVE` (4,096 tokens kept free beyond the
+prompt); `KT_PREFILL_SWA_TOKENS`, `KT_PREFILL_SWA_SIZING_CHUNK` (2,048),
+`KT_PREFILL_SWA_LEND_KEEP` (4,096), `KT_PREFILL_SWA_CHUNKS_IN_FLIGHT` (from
+SGLang's overlap scheduler: 2, else 1); `KT_GPU_STREAM_ROW_BLOCK` (4,096);
+`KT_KV_VMM_LIB`, `KV_VMM_CHUNK_MB` (8); `KT_PREFILL_KV_LEND_VERIFY`,
+`KT_PREFILL_KV_LEND_FORCE` (checks).
 
 ## Requirements and limits
 
@@ -309,9 +441,9 @@ full pool. The lend takes nothing from the KV pool by default:
   decoder that reads decoder weights during prefill, faults (illegal address)
   instead of reading stale data. `KT_PREFILL_LEND_SKIP` (default `engram`)
   keeps matching parameters resident.
-- The chunk is fixed at launch; what a run measures applies to the next
-  launch, which raises the chunk at most twofold. A window of fewer rows than
-  the chunk only lowers it.
+- Without the plan the chunk is fixed at launch; what a run measures applies
+  to the next launch, which raises the chunk at most twofold. A window of fewer
+  rows than the chunk only lowers it.
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is refused by
   torch_memory_saver.
 - An extend below the streaming threshold runs with the weights back unless
@@ -321,6 +453,10 @@ full pool. The lend takes nothing from the KV pool by default:
   plus a ~160-token tail, and a few-token turn on a long conversation.
 - The Flash-Next tree's GPU expert path does not run with 0 hot experts (with
   or without the lend); use at least 1.
+- The plan's KV loan needs a pool allocator with one free list (SGLang's paged
+  and token allocators, and an SWA allocator's two sides); others run without
+  the loan. The SWA lend needs the KV cache configurator of SGLang's newer
+  trees.
 
 ## Knobs
 
@@ -500,6 +636,18 @@ For porting to another tree. Five points, none in a model file:
   after checking the weights fit back (it raises with the numbers instead of
   letting the remap abort).
 - the prefill-only buffers: `kt_lend.scratch_empty(...)` / `scratch_region()`.
+
+With the plan (`kv-vmm/sglang-kt-kv-vmm.py`), four more: the no-op memory
+saver's `region("kv_cache")` becomes `kt_kv_vmm.region()`; the scheduler
+records each queued request's prompt length (`_add_request_to_queue`) and asks
+`kt_prefill_plan.chunk_for` for the chunk of the batch it is about to make
+(`get_new_batch_prefill`); the KV cache configurator budgets the pools under
+`kt_kv_prefill_lend.swa_sizing()`, widens the SWA pool with `swa_size` and
+sets up its lend with `swa_init`; the chunk-cache SWA eviction asks
+`kt_prefill_plan.chunk_in_flight`. The loan itself runs from `kt_lend`'s
+window: lent after the window's free memory is measured, mapped back before
+the weights, and SWA pages handed back since the last forward mapped at the
+next one's start.
 
 A layer is entered through its forward pre-hook, a pre-hook on each child
 holding lent parameters, or any other `forward*` method of the layer (DeepSeek

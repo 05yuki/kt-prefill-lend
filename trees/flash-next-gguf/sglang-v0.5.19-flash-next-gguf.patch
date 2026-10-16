@@ -37753,10 +37753,10 @@ index 0000000..c02223c
 +    log("installed")
 diff --git a/python/sglang/srt/layers/moe/kt_lend.py b/python/sglang/srt/layers/moe/kt_lend.py
 new file mode 100644
-index 0000000..0a15ce9
+index 0000000..b052abe
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend.py
-@@ -0,0 +1,892 @@
+@@ -0,0 +1,1068 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""KT prefill lend (KT_PREFILL_LEND=1): during a streamed prefill the
 +GPU-resident weights hand their physical memory to the prefill and come back,
@@ -37861,6 +37861,11 @@ index 0000000..0a15ce9
 +# its weights and KV pool back does not have room for (10-06). Not with IDLE:
 +# its weights are not brought back for a forward the streamer does not take.
 +LONG_SEQ = int(os.environ.get("KT_PREFILL_LEND_LONG_SEQ", "65536"))
++# KT_PREFILL_LEND_SNAPSHOT=<prefix>: torch's allocation history of the first
++# window of at least KT_PREFILL_LEND_SNAPSHOT_ROWS rows (16384), dumped to
++# <prefix>-<device>.pickle at its end (tools/mem-peak-breakdown.py reads it)
++SNAPSHOT = os.environ.get("KT_PREFILL_LEND_SNAPSHOT", "")
++SNAPSHOT_ROWS = int(os.environ.get("KT_PREFILL_LEND_SNAPSHOT_ROWS", "16384"))
 +
 +STATE = {"phase": "load", "scratch_bytes": 0, "scratch_chunk_bytes": 0, "to_prefill": 0, "to_decode": 0}
 +_saver = None
@@ -37895,6 +37900,26 @@ index 0000000..0a15ce9
 +        shape = getattr(t, "tensor_shape", None)
 +        return int(math.prod(shape)) * 9 // 8 if shape else 0
 +    return t.numel() * t.element_size()
++
++
++def _pinned_bounce(n: int):
++    """(a pinned host buffer of n bytes, whether it is reused). KT_FAST_PINNED=1
++    with kt_pinned: one reused bounce instead of a cudaHostAlloc per layer; the
++    copies through it are synchronous, so the next layer may reuse it."""
++    try:
++        from sglang.srt.layers.moe import kt_pinned
++    except ImportError:
++        return torch.empty(n, dtype=torch.uint8, pin_memory=True), False
++    return kt_pinned.bounce(n), bool(kt_pinned.ENABLED)
++
++
++def _pinned_empty(n: int) -> torch.Tensor:
++    """The host mirror: THP + cudaHostRegister with kt_pinned (KT_FAST_PINNED=1)."""
++    try:
++        from sglang.srt.layers.moe import kt_pinned
++    except ImportError:
++        return torch.empty(n, dtype=torch.uint8, pin_memory=True)
++    return kt_pinned.empty((n,), torch.uint8)
 +
 +
 +def phase() -> str:
@@ -38166,11 +38191,7 @@ index 0000000..0a15ce9
 +    # room for the small parameters an owner may take in): freeing a span
 +    # and making a slightly larger one cut a new segment per layer on one
 +    # Flash-Next rank, and the card ran out after ~20 layers
-+    # KT_FAST_PINNED=1: one reused pinned bounce instead of a cudaHostAlloc
-+    # per layer (patches/sglang-kt-fast-load.py)
-+    from sglang.srt.layers.moe import kt_pinned
-+
-+    host, src = kt_pinned.bounce(span), None
++    (host, reused), src = _pinned_bounce(span), None
 +    for item in new:
 +        src = getattr(item[1], item[2]) if item[0] == "owner" else layer.get_parameter(item[1])
 +        _place(host, item).copy_(src)
@@ -38180,8 +38201,8 @@ index 0000000..0a15ce9
 +    # the decode span ends before the prefill-only weights; one that holds 1 MiB
 +    # or more of them is made anew so the memory goes back. Not for the bind's
 +    # slack: a span freed and made again does not go back to the driver (the
-+    # pool keeps the segment), and 48 layers of that ran a rank out of memory
-+    # with KT_PREFILL_LEND_PFONLY on a safetensors checkpoint
++    # pool keeps the segment), and 48 layers of that ran a Flash-Next rank out
++    # of memory with KT_PREFILL_LEND_PFONLY (10-15)
 +    held = full.numel()
 +    shrink = dec < span and pf_held >= (1 << 20)
 +    in_place = dec <= held and not shrink
@@ -38206,7 +38227,7 @@ index 0000000..0a15ce9
 +    if dec < span:
 +        _pfonly_empty(layer, new, dec)
 +        # the mirror is built from this copy (the span no longer holds it all)
-+        STATE.setdefault("relayout_host", {})[i] = host.clone() if kt_pinned.ENABLED else host
++        STATE.setdefault("relayout_host", {})[i] = host.clone() if reused else host
 +    STATE["dev_spans"][i] = dspan
 +    STATE["layouts"][i] = new
 +    STATE["spans"][i] = span
@@ -38251,10 +38272,7 @@ index 0000000..0a15ce9
 +    for span in STATE["spans"]:
 +        bases.append(total)
 +        total += span
-+    # KT_FAST_PINNED=1: THP + cudaHostRegister (patches/sglang-kt-fast-load.py)
-+    from sglang.srt.layers.moe import kt_pinned
-+
-+    host = kt_pinned.empty((total,), torch.uint8)
++    host = _pinned_empty(total)
 +    kept = STATE.pop("relayout_host", {})
 +    for i, (base, span, dspan) in enumerate(zip(bases, STATE["spans"], STATE["dev_spans"])):
 +        host[base:base + span].copy_(kept[i] if i in kept else dspan)
@@ -38289,6 +38307,13 @@ index 0000000..0a15ce9
 +    KT streamer's KT_GPU_STREAM_PREFILL, or in a tree without the streamer
 +    (GLM-5.3's) the full-GPU prefill's --kt-gpu-prefill-token-threshold."""
 +    if "threshold" not in STATE:
++        try:
++            from sglang.srt.layers.moe.kt_exl3_stream_prefill import THRESHOLD as _exl3_t
++        except ImportError:
++            _exl3_t = 0
++        if _exl3_t > 0:  # the EXL3 streamed prefill (kt_exl3_stream_prefill.py)
++            STATE["threshold"] = _exl3_t
++            return _exl3_t
 +        try:
 +            from sglang.srt.layers.moe.kt_stream_prefill import STREAM_THRESHOLD as t
 +        except ImportError:
@@ -38331,11 +38356,70 @@ index 0000000..0a15ce9
 +        return 0
 +
 +
++# -- per-forward records (kt_prefill_plan's cost model) ------------------------------
++# Every forward of a prefill window: rows, sequence end, the window's free memory
++# at its start and the KV pages lent to it, and the peaks above the window's
++# start (allocated, and reserved: what has to fit in free + loan). Appended to
++# <KT_PREFILL_LEND_HINT>-rank<r>.windows.jsonl; tools/kt-prefill-plan-constants.py
++# fits reserved = fixed + a * rows + b * sequence over them.
++
++
++def _rank() -> int:
++    if "rank" not in STATE:
++        try:
++            from sglang.srt.distributed import get_tensor_model_parallel_rank
++
++            STATE["rank"] = get_tensor_model_parallel_rank()
++        except Exception:
++            STATE["rank"] = STATE["device"].index
++    return STATE["rank"]
++
++
++def _fw_open(rows: int, seq: int) -> None:
++    dev = STATE["device"]
++    torch.cuda.reset_peak_memory_stats(dev)
++    STATE["fw"] = {"rows": int(rows), "seq": int(seq)}
++
++
++def _fw_close() -> None:
++    fw = STATE.pop("fw", None)
++    if fw is None:
++        return
++    dev = STATE["device"]
++    resv = torch.cuda.max_memory_reserved(dev)
++    alloc = torch.cuda.max_memory_allocated(dev)
++    STATE["win_resv_peak"] = max(STATE.get("win_resv_peak", 0), resv)
++    STATE["win_alloc_peak"] = max(STATE.get("win_alloc_peak", 0), alloc)
++    if not HINT:
++        return
++    loan = 0
++    try:
++        from sglang.srt.layers.moe import kt_kv_prefill_lend
++
++        loan = int(kt_kv_prefill_lend.STATE.get("bytes", 0) or 0)
++    except Exception:
++        pass
++    rec = dict(fw, free=int(STATE["pf_free"]), loan=loan, resv=int(resv - STATE["pf_base"]),
++               alloc=int(alloc - STATE.get("pf_abase", 0)), chunk=_chunk(), window=STATE.get("to_prefill", 0))
++    try:
++        import json
++
++        with open(f"{HINT}-rank{_rank()}.windows.jsonl", "a") as f:
++            f.write(json.dumps(rec) + "\n")
++    except Exception:
++        pass
++
++
 +def _write_hint(rank: int) -> None:
 +    import json
 +
 +    rows = STATE.get("pf_rows", 0)
 +    chunk = _chunk()
++    # under the prefill plan the launch chunk is its cap; the lend's own chunk is
++    # the one this hint is about (with the cap here, a 12,288-row window kept the
++    # cap on record and GLM's next launch took 32,768 as its own chunk, 10-16)
++    if os.environ.get("KT_PREFILL_PLAN", "0") == "1":
++        chunk = int(os.environ.get("KT_PREFILL_PLAN_SAFE", "0") or 0) or chunk
 +    if not HINT or rows < 2048 or chunk <= 0:
 +        return
 +    growth = STATE["pf_peak"] - STATE["pf_base"]
@@ -38369,7 +38453,15 @@ index 0000000..0a15ce9
 +    hint = min(hint, STATE.get("hint_min", hint))
 +    if keep_min:
 +        STATE["hint_min"] = hint
-+    rec = {"chunk": hint, "current_chunk": chunk, "rows_seen": rows,
++    # allocated bytes a row, which unlike the reserved peak does not grow with
++    # the free memory (kt_prefill_plan's per-row cost; the largest of the launch)
++    alloc_row = int(((STATE.get("win_alloc_peak") or torch.cuda.max_memory_allocated(STATE["device"]))
++                     - STATE.get("pf_abase", 0)) / rows)
++    STATE["alloc_row_max"] = max(STATE.get("alloc_row_max", 0), alloc_row)
++    rec = {"chunk": hint, "current_chunk": chunk, "rows_seen": rows, "alloc_per_row": STATE["alloc_row_max"],
++           # free at a window's start minus free in decode before it: the plan's step
++           # from the live decode free memory, known to the next launch's first request
++           "pf_delta_mb": STATE.get("pf_delta", 0) >> 20,
 +           "free_at_prefill_mb": STATE["pf_free"] >> 20, "peak_growth_mb": growth >> 20,
 +           "margin_mb": MARGIN >> 20, "bytes_per_token": round(per_tok),
 +           "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20,
@@ -38462,7 +38554,14 @@ index 0000000..0a15ce9
 +        return
 +    streamed = _streamed(forward_batch)
 +    rows = forward_batch.input_ids.shape[0]
++    # SWA pages handed back since the last forward are mapped before it runs; a
++    # window that opens maps them after the weights have left (KT_PREFILL_SWA_LEND)
++    m = _kv_mod()
++    if m is not None and not (streamed and STATE["phase"] == "decode") \
++            and any(getattr(m, "SWA", {}).get("pending") or ()):
++        m.swa_flush("forward")
 +    if streamed and STATE["phase"] == "prefill":
++        _fw_close()
 +        STATE["pf_rows"] = max(STATE.get("pf_rows", 0), rows)
 +        seq = _seq_len(forward_batch)
 +        STATE["pf_seq"] = max(STATE.get("pf_seq", 0), seq)
@@ -38473,6 +38572,7 @@ index 0000000..0a15ce9
 +            # pieces: at a 999K-token prefix 5,624 MiB reserved for 2,927 MiB
 +            # allocated (10-07). Hand the unused segments back before each chunk.
 +            torch.cuda.empty_cache()
++        _fw_open(rows, seq)
 +    elif streamed and STATE["phase"] == "decode":
 +        t = time.perf_counter()
 +        dev = STATE["device"]
@@ -38484,7 +38584,10 @@ index 0000000..0a15ce9
 +            torch.cuda.memory._record_memory_history(max_entries=500000)
 +            STATE["history"] = True
 +        _tms().pause(TAG_WEIGHTS)
++        free_a = torch.cuda.mem_get_info(dev)[0]
 +        _tms().resume(TAG_SCRATCH)
++        # what the scratch maps at a window's start (end_window compares)
++        STATE["scratch_at_start"] = max(0, free_a - torch.cuda.mem_get_info(dev)[0])
 +        torch.cuda.synchronize(dev)
 +        # what decode freed (the last prefill's attention metadata, released at
 +        # the first graph replay) sits in torch's cache, which mem_get_info
@@ -38514,12 +38617,56 @@ index 0000000..0a15ce9
 +                STATE["full_tokens"] = int(getattr(runner, "max_total_num_tokens", 0) or 0)
 +            except Exception:
 +                STATE["full_tokens"] = 0
++        if SNAPSHOT and not STATE.get("snap_done") and rows >= SNAPSHOT_ROWS:
++            torch.cuda.memory._record_memory_history(enabled="all", context="all", stacks="python",
++                                                     max_entries=4_000_000)
++            STATE["snap_on"] = True
 +        STATE.update(phase="prefill", pf_issued=set(), pf_rows=rows, pf_seq=_seq_len(forward_batch))
++        # free at a window's start minus free in decode just before it (weights out,
++        # scratch in): kt_prefill_plan adds it to the live decode free memory
++        STATE["pf_delta"] = STATE["pf_free"] - STATE["dec_free"]
++        STATE["win_resv_peak"] = STATE["win_alloc_peak"] = 0
++        _fw_open(rows, STATE["pf_seq"])
 +        STATE["to_prefill"] += 1
++        _kv_loan(forward_batch)
++        if m is not None and hasattr(m, "swa_flush"):
++            m.swa_flush("window start")
 +        if STATE["to_prefill"] in (1, 10, 100, 1000):
 +            _log(f"to prefill in {(time.perf_counter() - t) * 1e3:.1f} ms ({STATE['to_prefill']} so far)")
 +    elif not streamed and STATE["phase"] == "prefill":
 +        end_window()
++    elif STATE["phase"] == "decode":
++        m = _kv_mod()
++        if m is not None and getattr(m, "SWA_ENABLED", False):
++            m.swa_tick()
++
++
++def _kv_mod():
++    """kt_kv_prefill_lend when kv-vmm is installed in this tree, else None."""
++    if "kv_mod" not in STATE:
++        try:
++            from sglang.srt.layers.moe import kt_kv_prefill_lend
++        except ImportError:
++            kt_kv_prefill_lend = None
++        STATE["kv_mod"] = kt_kv_prefill_lend
++    return STATE["kv_mod"]
++
++
++def _kv_loan(forward_batch) -> None:
++    """A window just opened: the KV pool's free pages lend their memory too, when
++    kv-vmm is installed (kt_kv_prefill_lend; it decides whether the window needs them)."""
++    try:
++        from sglang.srt.layers.moe import kt_kv_prefill_lend
++    except ImportError:
++        return
++    if not kt_kv_prefill_lend.ENABLED:
++        return
++    import inspect
++
++    # the ModelRunner that calls before_forward (as for full_tokens above)
++    frame = inspect.currentframe().f_back.f_back
++    runner = frame.f_locals.get("self") if frame is not None else None
++    kt_kv_prefill_lend.lend(runner, forward_batch)
 +
 +
 +def end_window() -> None:
@@ -38531,7 +38678,14 @@ index 0000000..0a15ce9
 +    if True:
 +        t = time.perf_counter()
 +        dev = STATE["device"]
-+        STATE["pf_peak"] = torch.cuda.max_memory_reserved(dev)
++        _fw_close()
++        STATE["pf_peak"] = STATE.get("win_resv_peak") or torch.cuda.max_memory_reserved(dev)
++        if STATE.get("snap_on"):
++            path = f"{SNAPSHOT}-{dev.index}.pickle"
++            torch.cuda.memory._dump_snapshot(path)
++            torch.cuda.memory._record_memory_history(enabled=None)
++            STATE.update(snap_on=False, snap_done=True)
++            _log(f"allocation history of window {STATE['to_prefill']} ({STATE.get('pf_rows', 0)} rows) in {path}")
 +        if DEBUG:
 +            # one line a window for fitting the growth to rows and sequence
 +            # length; "outside torch" is how much more the device held outside
@@ -38551,10 +38705,32 @@ index 0000000..0a15ce9
 +            rank = get_tensor_model_parallel_rank()
 +        except Exception:
 +            rank = dev.index
-+        _write_hint(rank)
 +        _leave()
 +        torch.cuda.empty_cache()
++        free_c = torch.cuda.mem_get_info(dev)[0]
 +        _tms().pause(TAG_SCRATCH)
++        grew = max(0, torch.cuda.mem_get_info(dev)[0] - free_c) - STATE.get("scratch_at_start", 0)
++        if grew > (16 << 20) and STATE.get("pf_delta") is not None:
++            # the scratch keeps what this window first made in it (GLM-5.3's 2.11 GiB
++            # prefill slot, a lent CUTLASS workspace): the next window starts with that
++            # much less free, and it is no per-row cost of later windows. The step
++            # measured at this window's start did not know it (a planned first 35K ran
++            # out of memory on it, 10-16), and the hint must not count it as growth
++            STATE["pf_delta"] -= grew
++            STATE["pf_free"] -= grew
++            STATE["pf_peak"] -= grew
++            if STATE.get("win_alloc_peak"):
++                STATE["win_alloc_peak"] -= grew
++            _log(f"the scratch kept {grew >> 20} MiB made in window {STATE['to_prefill']}: the decode -> "
++                 f"window step is {STATE['pf_delta'] >> 20} MiB from now on")
++        _write_hint(rank)
++        # the free KV pages lent to this window first (kv-vmm); the sliding-window
++        # pool's free pages leave again (KT_PREFILL_SWA_LEND)
++        kt_kv_prefill_lend = _kv_mod()
++        if kt_kv_prefill_lend is not None:
++            kt_kv_prefill_lend.restore()
++            if getattr(kt_kv_prefill_lend, "SWA_ENABLED", False):
++                kt_kv_prefill_lend.swa_lend("end of window")
 +        _check_room(dev)
 +        _tms().resume(TAG_WEIGHTS)
 +        for base, span, dspan in zip(STATE["bases"], STATE["spans"], STATE["dev_spans"]):

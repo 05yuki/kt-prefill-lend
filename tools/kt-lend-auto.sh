@@ -1,6 +1,6 @@
 # Sourced by a launcher under KT_PREFILL_LEND=1 (patches/kt_lend.py): picks the
 # prefill chunk from what the server measured, calibrating once when there is
-# nothing to go on.
+# nothing to go on. Flash-Next's launcher has its own copy of the same steps.
 #
 #   kt_lend_auto <launcher> <chunk env var> <port> <key part>...
 #
@@ -29,8 +29,19 @@ PY
 _kt_lend_auto_core() {
   local launcher="$1" chunk_var="$2" port="$3"
   shift 3
-  local key
-  key="$(printf '%s|' "$@" | sha1sum | cut -c1-16)"
+  local key extra=()
+  # the plan's row blocks (KT_GPU_STREAM_ROW_BLOCK: the CUTLASS MoE workspace
+  # sized for a block of rows, not the chunk) on by default with it
+  if [[ "${KT_PREFILL_PLAN:-0}" == 1 ]]; then
+    export KT_GPU_STREAM_ROW_BLOCK="${KT_GPU_STREAM_ROW_BLOCK:-4096}"
+  fi
+  [[ "${KT_GPU_STREAM_ROW_BLOCK:-0}" != 0 ]] && extra+=("rowblock$KT_GPU_STREAM_ROW_BLOCK")
+  # the KV pool's loans change what a window has: their hints are kept apart
+  [[ "${KT_KV_VMM:-0}" == 1 ]] && extra+=("kvvmm")
+  [[ "${KT_PREFILL_KV_LEND:-0}" == 1 ]] && extra+=("kvlend")
+  [[ "${KT_PREFILL_PLAN:-0}" == 1 ]] && extra+=("plan")
+  [[ "${KT_PREFILL_SWA_LEND:-0}" == 1 ]] && extra+=("swalend")
+  key="$(printf '%s|' "$@" "${extra[@]}" | sha1sum | cut -c1-16)"
   mkdir -p "$HOME/.cache/kt-lend"
   export KT_PREFILL_LEND_HINT="$HOME/.cache/kt-lend/chunk-$key"
   local user="${!chunk_var:-}"
@@ -184,11 +195,51 @@ EOF
   fi
 }
 
-# kt_lend_auto <launcher> <chunk env var> <port> <key part>...: the chunk
-# (the steps above), then the KV guard.
+# KT_PREFILL_LEND_DYNAMIC=1: the chunk follows the prompt. Every rank's hint
+# file carries points (sequence length, cost per row, free memory) from the
+# full windows of earlier launches; from all of them one table goes to every
+# rank in KT_PREFILL_LEND_TABLE, so the schedulers agree, and the scheduler's
+# chunk sizer (patches/sglang-kt-lend-dynamic-chunk.py) asks kt_lend.table_chunk
+# for each later chunk of a request. The server starts at the table's chunk for
+# a short prefix, at most KT_PREFILL_LEND_DYNAMIC_MAX (the hint by default).
 kt_lend_auto() {
   _kt_lend_auto_core "$@" || return $?
   [[ -n "${!2:-}" ]] || _kt_lend_kv_guard
+  unset KT_PREFILL_LEND_TABLE
+  [[ "${KT_PREFILL_LEND_DYNAMIC:-0}" == 1 && -z "${!2:-}" ]] || return 0
+  local table
+  table="$(python3 - "$KT_PREFILL_LEND_HINT" "$KT_LEND_CHUNK" "${KT_PREFILL_LEND_DYNAMIC_MAX:-}" \
+    "${KT_PREFILL_LEND_MARGIN_MB:-256}" <<'EOF'
+import glob, json, sys
+prefix, chunk, top, margin = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+best = {}  # bucket -> the costliest point over the ranks
+for f in glob.glob(prefix + "-rank*.json"):
+    for k, p in json.load(open(f)).get("points", {}).items():
+        if k not in best or p["per_row"] > best[k]["per_row"]:
+            best[k] = p
+if best:
+    # no wider than the launch chunk unless asked: a wider chunk needs a wider
+    # SWA cap, which on V4 / MiMo comes out of the KV pool
+    top = int(top) if top else chunk
+    print(json.dumps({"free": min(p["free"] for p in best.values()), "margin": margin << 20,
+                      "max": top, "step": 1024,
+                      "points": [{"seq": p["seq"], "per_row": p["per_row"]} for p in best.values()]}))
+EOF
+)"
+  if [[ -z "$table" ]]; then
+    echo "dynamic chunk: no measured points yet; fixed chunk $KT_LEND_CHUNK" >&2
+    return 0
+  fi
+  export KT_PREFILL_LEND_TABLE="$table"
+  KT_LEND_CHUNK="$(python3 - "$root/patches/kt_lend.py" <<'EOF'
+import json, os, sys
+src = open(sys.argv[1]).read()
+ns = {"os": os, "Optional": None, "STATE": {}, "MARGIN": 0}
+exec(src[src.index("def table_chunk("):src.index("\ndef before_forward(")], ns)
+print(ns["table_chunk"](0, json.loads(os.environ["KT_PREFILL_LEND_TABLE"])))
+EOF
+)"
+  echo "dynamic chunk: a table of $(python3 -c 'import json, os; print(len(json.loads(os.environ["KT_PREFILL_LEND_TABLE"])["points"]))') points, starting at chunk $KT_LEND_CHUNK" >&2
 }
 
 # The DeepSeek V4 / MiMo SWA pool is full_tokens x ratio and must hold one
@@ -202,7 +253,12 @@ kt_lend_auto() {
 # 13.9K rows and 40K prompts 1,107 -> 1,331 tok/s, but the full pool to 81,552
 # (39 sliding layers to 9 full ones: each SWA token costs several full ones).
 kt_lend_swa_ratio() {  # chunk max_total_tokens ratio
-  python3 - "$1" "$2" "$3" "${KT_PREFILL_LEND_HINT:-}" "${KT_PREFILL_LEND_SWA_FIT:-0}" <<'PY'
+  # the SWA lend (kt_prefill_plan_setup): the budget holds a small chunk (the server
+  # budgets at the same one, and DeepSeek V4 refuses a pool under the chunk it is
+  # sized at); the server widens the pool for the cap outside the budget and lends it
+  local chunk="$1"
+  [[ -n "${KT_PREFILL_SWA_TOKENS:-}" ]] && chunk="${KT_PREFILL_SWA_SIZING_CHUNK:-2048}"
+  python3 - "$chunk" "$2" "$3" "${KT_PREFILL_LEND_HINT:-}" "${KT_PREFILL_LEND_SWA_FIT:-0}" <<'PY'
 import glob, json, sys
 c, m, r, hint, fit = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), sys.argv[4], sys.argv[5] == "1"
 full = [json.load(open(f)).get("full_tokens", 0) for f in glob.glob(hint + "-rank*.json")] if hint and fit else []
@@ -211,4 +267,50 @@ if full:
     m = min(m, int(min(full) * 0.97))
 print(f"{max(r, (c + 512) * 1.02 / m):.4f}")
 PY
+}
+
+# KT_PREFILL_PLAN=1 (patches/kv-vmm/kt_prefill_plan.py, with KT_KV_VMM=1 and
+# KT_PREFILL_KV_LEND=1): the chunk planned per request. Called after kt_lend_auto:
+# the launch chunk becomes the cap (KT_PREFILL_PLAN_CAP, 36864) and the room and
+# the cost a row come from the lend's measurements of this setup
+# (tools/kt-prefill-plan-constants.py over the hint files); without them the plan
+# is off for this launch. KT_PREFILL_SWA_LEND=1 (a hybrid SWA model): the
+# sliding-window pool is sized for the cap (KT_PREFILL_SWA_TOKENS) outside the KV
+# budget, its free pages unmapped outside prefill, and kt_lend_swa_ratio keeps the
+# launcher's own ratio. Sets KT_LEND_CHUNK. A launcher of a hybrid SWA model
+# passes "swa": without the SWA lend a cap past the lend's chunk would widen the
+# SWA pool out of the KV budget, so the cap stays the lend's chunk there.
+kt_prefill_plan_setup() {
+  [[ "${KT_PREFILL_PLAN:-0}" == 1 && -z "${KT_PREFILL_LEND_CALIBRATING:-}" && -n "${KT_PREFILL_LEND_HINT:-}" ]] || return 0
+  local lib="${KT_KV_VMM_LIB:-${root:-.}/runtime/kv-vmm/libkv_vmm.so}"
+  if [[ ! -f "$lib" ]]; then
+    echo "$lib missing (build kv_vmm.c, or set KT_KV_VMM_LIB): prefill plan off" >&2
+    export KT_PREFILL_PLAN=0 KT_PREFILL_SWA_LEND=0
+    return 0
+  fi
+  local cap="${KT_PREFILL_PLAN_CAP:-36864}" pf_free pf_row pf_cost pf_delta
+  if [[ -z "${KT_PREFILL_PLAN_FREE_MB:-}" && -z "${KT_PREFILL_PLAN_ROW_KB:-}" && -z "${KT_PREFILL_PLAN_COST:-}" ]]; then
+    read -r pf_free pf_row pf_cost pf_delta <<<"$(python3 "$(dirname "${BASH_SOURCE[0]}")/kt-prefill-plan-constants.py" "$KT_PREFILL_LEND_HINT" "$cap")"
+    if [[ -n "${pf_free:-}" ]]; then
+      export KT_PREFILL_PLAN_FREE_MB="$pf_free" KT_PREFILL_PLAN_ROW_KB="$pf_row"
+      [[ "${pf_cost:--}" != - ]] && export KT_PREFILL_PLAN_COST="$pf_cost"
+      [[ "${pf_delta:-0}" != 0 ]] && export KT_PREFILL_PLAN_DELTA_MB="$pf_delta"
+    fi
+  fi
+  if [[ "${KT_PREFILL_PLAN_ROW_KB:-0}" == 0 && -z "${KT_PREFILL_PLAN_COST:-}" ]]; then
+    export KT_PREFILL_PLAN=0
+    echo "prefill plan: no measurement of this setup yet, off for this launch (chunk $KT_LEND_CHUNK)" >&2
+    return 0
+  fi
+  # the lend's chunk stays the fallback before the first window measures anything
+  export KT_PREFILL_PLAN_SAFE="${KT_PREFILL_PLAN_SAFE:-$KT_LEND_CHUNK}"
+  if [[ "${1:-}" == swa && "${KT_PREFILL_SWA_LEND:-0}" != 1 ]] && (( cap > KT_LEND_CHUNK )); then
+    cap="$KT_LEND_CHUNK"
+  fi
+  KT_LEND_CHUNK="$cap"
+  export KT_PREFILL_PLAN_MARGIN_MB="${KT_PREFILL_PLAN_MARGIN_MB:-128}"
+  if [[ "${KT_PREFILL_SWA_LEND:-0}" == 1 ]]; then
+    export KT_PREFILL_SWA_TOKENS="${KT_PREFILL_SWA_TOKENS:-$(( (cap + 512) * 102 / 100 ))}"
+  fi
+  echo "prefill plan: cost ${KT_PREFILL_PLAN_COST:-${KT_PREFILL_PLAN_ROW_KB} KiB a row}, chunk cap $cap${KT_PREFILL_SWA_TOKENS:+, SWA pool $KT_PREFILL_SWA_TOKENS tokens lent outside prefill}" >&2
 }
