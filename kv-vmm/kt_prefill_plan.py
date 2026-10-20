@@ -109,7 +109,24 @@ def _free_now(scheduler) -> int:
     if delta is None and DELTA:
         # before this launch's first window: the step an earlier launch measured
         delta = DELTA
-    mine = torch.cuda.mem_get_info()[0] + delta if delta is not None else -1
+    if kt_lend.STATE.get("phase") == "prefill":
+        # a request taken while the window is still open (long prompts back to back,
+        # no decode between): the device is already in the window's state, so decode
+        # free + step reads low by torch's cached blocks of the last chunk (V4.1-1017,
+        # 35K then 131K: 5,575 MiB planned against 7,390 at the window's start). What
+        # the next chunks have is the device's free memory now plus those blocks; not
+        # the window's start, which misses what the window has kept since (the
+        # stream's buffers grown to a larger chunk: 131K planned at 13,312 rows ran out)
+        mine = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    elif delta is not None:
+        mine = torch.cuda.mem_get_info()[0] + delta
+    else:
+        mine = -1
+    if mine >= 0:
+        # what earlier windows left in the lend's scratch (the stream's buffers and
+        # graph pool) is reused by the next chunks, and the fitted cost includes it
+        # (kt_lend.end_window)
+        mine += int(kt_lend.STATE.get("scratch_kept", 0) or 0)
     t = torch.tensor([mine], dtype=torch.int64)
     group = getattr(scheduler, "tp_cpu_group", None)
     if group is not None and torch.distributed.is_initialized():

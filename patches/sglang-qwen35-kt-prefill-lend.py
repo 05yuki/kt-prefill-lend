@@ -168,9 +168,10 @@ edit(S, "kt_lend.scratch_region", [('''        self.slots = [_DeviceSlot(self.G,
         g["x"].copy_(x)
 '''), ('''    def _graph_for(self, layer, T: int, gi: int, base: int, n: int, g):
 ''', '''    def _gin_view(self, name, T, shape, dtype, device):
-        """The head of the base for `name`, made for max(T, 2048) rows (the
-        whole chunk under the KT prefill lend, in its scratch) or grown when T
-        does not fit; views of an older base keep it and its graphs alive."""
+        """The head of the base for `name`, made for max(T, 2048) rows (under the
+        KT prefill lend, in its scratch and in whole steps of KT_STREAM_GIN_STEP
+        rows, 4096) or grown when T does not fit; a grown base replaces the old
+        one, whose views and graphs are dropped so it returns to the scratch."""
         from sglang.srt.layers.moe import kt_lend
 
         bases = self.__dict__.setdefault("_gin_base", {})
@@ -182,8 +183,17 @@ edit(S, "kt_lend.scratch_region", [('''        self.slots = [_DeviceSlot(self.G,
         if base is None or base.numel() < need:
             rows = max(T, 2048)
             if kt_lend.ENABLED:
-                rows = max(rows, kt_lend._chunk())
+                # not to the launch chunk: under the prefill plan that is its cap
+                # (36,864), far above any chunk the memory allows
+                step = int(os.environ.get("KT_STREAM_GIN_STEP", "4096") or 0)
+                rows = -(-rows // step) * step if step > 0 else max(rows, kt_lend._chunk())
             nbytes = -(-(need * rows // T) // 256) * 256
+            if base is not None:
+                torch.cuda.synchronize(device)
+                self._gin.clear()
+                self._graphs.clear()
+                del base
+                bases.pop(name, None)
             with kt_lend.scratch_region():
                 base = torch.zeros(max(nbytes, need), dtype=torch.uint8, device=device)
             bases[name] = base

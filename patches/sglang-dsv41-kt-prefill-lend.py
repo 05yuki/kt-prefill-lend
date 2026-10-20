@@ -160,7 +160,13 @@ edit(S, "kt_lend.scratch_region", [('''        self.slots = [
             with kt_lend.scratch_region():
                 slot.raw = torch.empty((3, self.G, wstride), dtype=torch.uint8, device=self.device)
                 slot.raw_s = torch.empty((3, self.G, sstride), dtype=torch.uint8, device=self.device)
-'''), [('''            base = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+'''), [('''            # Views made from an older base keep it (and their graphs) alive.
+            base = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+''', '''            from sglang.srt.layers.moe import kt_lend
+
+            with kt_lend.scratch_region():
+                base = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+'''), ('''            base = torch.zeros(nbytes, dtype=torch.uint8, device=device)
 ''', '''            from sglang.srt.layers.moe import kt_lend
 
             with kt_lend.scratch_region():
@@ -200,13 +206,24 @@ edit(S, "kt_lend.scratch_region", [('''        self.slots = [
                     self._workspace = preallocate_shared_cutlass_workspace(nbytes, x.device)
 ''')])
 
-# shared graph-input bases sized for the chunk at once under the lend: they
-# live in the scratch (resident only while prefilling), and a base grown for a
-# later, longer T stays alive beside the old one (graphs hold views of both)
-edit(S, "kt_lend: the whole chunk", [('''            rows = max(T, 2048)
+# shared graph-input bases under the lend: they live in the scratch (resident
+# only while prefilling), grown in whole steps of KT_STREAM_GIN_STEP rows (4096),
+# not to the launch chunk: under the prefill plan that is its cap (36,864), far
+# above any chunk the memory allows (1,081 MiB in every window's scratch on
+# V4.1-1017, 10-20). A grown base replaces the old one: the views and graphs
+# made on the old base go with it, so it returns to the scratch
+edit(S, "kt_lend: GIN_STEP rows", [('''            rows = max(T, 2048)
 ''', '''            rows = max(T, 2048)
             from sglang.srt.layers.moe import kt_lend
 
-            if kt_lend.ENABLED:  # kt_lend: the whole chunk
-                rows = max(rows, kt_lend._chunk())
+            if kt_lend.ENABLED:  # kt_lend: GIN_STEP rows
+                step = int(os.environ.get("KT_STREAM_GIN_STEP", "4096") or 0)
+                rows = -(-rows // step) * step if step > 0 else max(rows, kt_lend._chunk())
+            if base is not None:
+                torch.cuda.synchronize(device)
+                self._gin.clear()
+                self._graphs.clear()
+                getattr(self, "_graph_use", {}).clear()
+                del base
+                self._gin_base.pop(name, None)
 ''')])

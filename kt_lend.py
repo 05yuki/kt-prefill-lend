@@ -640,8 +640,10 @@ def _fw_close() -> None:
         loan = int(kt_kv_prefill_lend.STATE.get("bytes", 0) or 0)
     except Exception:
         pass
-    rec = dict(fw, free=int(STATE["pf_free"]), loan=loan, resv=int(resv - STATE["pf_base"]),
-               alloc=int(alloc - STATE.get("pf_abase", 0)), chunk=_chunk(), window=STATE.get("to_prefill", 0))
+    kept = STATE.get("kept_at_start", 0)
+    rec = dict(fw, free=int(STATE["pf_free"] + kept), loan=loan, resv=int(resv - STATE["pf_base"]),
+               alloc=int(alloc - STATE.get("pf_abase", 0) + kept), chunk=_chunk(),
+               window=STATE.get("to_prefill", 0))
     try:
         import json
 
@@ -701,8 +703,10 @@ def _write_hint(rank: int) -> None:
     STATE["alloc_row_max"] = max(STATE.get("alloc_row_max", 0), alloc_row)
     rec = {"chunk": hint, "current_chunk": chunk, "rows_seen": rows, "alloc_per_row": STATE["alloc_row_max"],
            # free at a window's start minus free in decode before it: the plan's step
-           # from the live decode free memory, known to the next launch's first request
-           "pf_delta_mb": STATE.get("pf_delta", 0) >> 20,
+           # from the live decode free memory, known to the next launch's first request.
+           # Without the scratch earlier windows kept: that scratch lives in this
+           # process only, and a new launch's first window starts without it
+           "pf_delta_mb": STATE.get("pf_delta_seen", STATE.get("pf_delta", 0)) >> 20,
            "free_at_prefill_mb": STATE["pf_free"] >> 20, "peak_growth_mb": growth >> 20,
            "margin_mb": MARGIN >> 20, "bytes_per_token": round(per_tok),
            "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20,
@@ -866,6 +870,11 @@ def before_forward(forward_batch) -> None:
         # free at a window's start minus free in decode just before it (weights out,
         # scratch in): kt_prefill_plan adds it to the live decode free memory
         STATE["pf_delta"] = STATE["pf_free"] - STATE["dec_free"]
+        # what earlier windows left in the scratch (end_window), mapped again at this
+        # start: the records and the hint count it as free and the forwards' cost
+        # includes it, as in a launch's first window, which has to make it
+        STATE["kept_at_start"] = STATE.get("scratch_kept", 0)
+        STATE["pf_delta_seen"] = STATE["pf_delta"] + STATE["kept_at_start"]
         STATE["win_resv_peak"] = STATE["win_alloc_peak"] = 0
         _fw_open(rows, STATE["pf_seq"])
         STATE["to_prefill"] += 1
@@ -956,8 +965,14 @@ def end_window() -> None:
             # prefill slot, a lent CUTLASS workspace): the next window starts with that
             # much less free, and it is no per-row cost of later windows. The step
             # measured at this window's start did not know it (a planned first 35K ran
-            # out of memory on it, 10-16), and the hint must not count it as growth
+            # out of memory on it, 10-16), and the hint must not count it as growth.
+            # The next windows reuse it (the stream's buffers and graph pool), so the
+            # plan adds scratch_kept back to their free memory, and their records
+            # add it to free and cost, as in a first window that had to make it
+            # (counted on both sides, a second 35K got 6 chunks of 6,144 against
+            # the first's 5 of 7,168 on V4.1-1017, 10-21)
             STATE["pf_delta"] -= grew
+            STATE["scratch_kept"] = STATE.get("scratch_kept", 0) + grew
             STATE["pf_free"] -= grew
             STATE["pf_peak"] -= grew
             if STATE.get("win_alloc_peak"):

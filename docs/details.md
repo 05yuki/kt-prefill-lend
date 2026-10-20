@@ -225,7 +225,12 @@ in `kv-vmm/` and `patches/`, none model-specific:
   cost per row fitted from the lend's per-forward records
   (`tools/kt-prefill-plan-constants.py`; until enough are recorded, the lend's
   own reserved bytes a row). Until a launch's first window has measured the
-  step from decode to a window, a request gets the lend's own chunk.
+  step from decode to a window, a request gets the lend's own chunk. What
+  earlier windows left in the scratch (the streamer's buffers and graph pool)
+  counts as free, since the next chunks reuse it, and the records count it in
+  each forward's cost, as for a launch's first window, which has to make it.
+  A request taken while a window is still open (long prompts back to back)
+  is planned from the device's free memory then, plus torch's cached blocks.
 - **Row blocks** (`KT_GPU_STREAM_ROW_BLOCK=4096`,
   `patches/sglang-kt-stream-row-block.py` for the NVFP4 / GGUF streamers,
   `patches/sglang-kt-stream-row-block-dsv41.py` for the DeepSeek V4 one). The
@@ -387,6 +392,9 @@ SGLang's overlap scheduler: 2, else 1); `KT_GPU_STREAM_ROW_BLOCK` (4,096);
   (4 chunks a point) — run the probe directly.
 - `KT_STREAM_GRAPH_KEEP` — streamer CUDA graphs kept for row counts other
   than the largest (8).
+- `KT_STREAM_GIN_STEP` — under the lend, the DeepSeek V4 and Qwen3.5
+  streamers' shared graph inputs grow in steps of this many rows (4096), not
+  to the launch chunk (the plan's cap); `0` sizes them for the launch chunk.
 - `KT_PREFILL_LEND_DEBUG=1` — memory per prefill (reserved and allocated, and
   how much more the device held outside torch at the end), and a torch memory
   snapshot when a prefill leaves more than 256 MB outside the scratch.
