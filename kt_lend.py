@@ -24,7 +24,12 @@ its decoder layers (the largest ModuleList named "layers")
 and, per layer, every CUDA parameter of at least KT_PREFILL_LEND_MIN_BYTES
 (default 1 MiB) whose name contains none of KT_PREFILL_LEND_SKIP
 (comma-separated, default "engram": V4.1's engram is read ahead of its layer
-on another stream). Each layer gets one span, its own allocation in
+on another stream) or of KT_PREFILL_LEND_RESIDENT (comma-separated, default
+none; "hc_" on DeepSeek V4.1-1017 under SGLang main, whose layer boundary reads
+the next layer's hc mixing weights). The resident ones are packed into one
+buffer of their own first: left where they were, each would keep the torch
+cache block its lent neighbours are freed from (1.9 GB on V4.1-1017). Each
+layer gets one span, its own allocation in
 torch_memory_saver tag "kt_lend_weights", made layer by layer at the bind so
 the originals are dropped as it goes; the span has room for the layer's
 small parameters too, which the loading may stack into a fused owner.
@@ -82,6 +87,9 @@ HINT = os.environ.get("KT_PREFILL_LEND_HINT", "")
 MARGIN = int(os.environ.get("KT_PREFILL_LEND_MARGIN_MB", "256")) << 20
 DEBUG = os.environ.get("KT_PREFILL_LEND_DEBUG", "0") == "1"
 SKIP = [w for w in os.environ.get("KT_PREFILL_LEND_SKIP", "engram").split(",") if w]
+RESIDENT = [
+    w for w in os.environ.get("KT_PREFILL_LEND_RESIDENT", "").split(",") if w
+]
 # KT_PREFILL_LEND_IDLE: lent but not brought back layer by layer during a
 # prefill, for weights the prefill path never reads (GLM-5.3's hot experts:
 # its full-GPU prefill writes every expert into its own slot). Laid out at the
@@ -108,7 +116,13 @@ LONG_SEQ = int(os.environ.get("KT_PREFILL_LEND_LONG_SEQ", "65536"))
 SNAPSHOT = os.environ.get("KT_PREFILL_LEND_SNAPSHOT", "")
 SNAPSHOT_ROWS = int(os.environ.get("KT_PREFILL_LEND_SNAPSHOT_ROWS", "16384"))
 
-STATE = {"phase": "load", "scratch_bytes": 0, "scratch_chunk_bytes": 0, "to_prefill": 0, "to_decode": 0}
+STATE = {
+    "phase": "load",
+    "scratch_bytes": 0,
+    "scratch_chunk_bytes": 0,
+    "to_prefill": 0,
+    "to_decode": 0,
+}
 _saver = None
 
 
@@ -169,6 +183,7 @@ def phase() -> str:
 
 # -- scratch ---------------------------------------------------------------------
 
+
 def scratch_empty(shape, dtype, device, per_chunk: bool = False) -> torch.Tensor:
     """A tensor resident only during a streamed prefill (a plain one when
     lending is off). Call before the weights load. per_chunk: its size grows
@@ -198,25 +213,32 @@ def scratch_region():
 #   ("owner", module, attr, shape, dtype, off, nbytes, [(name, shape, dtype, delta, nbytes), ...])
 # where an owner's inner parameters are views at off + delta.
 
+
 def _decoder_layers(model):
     best, best_bytes = None, 0
     for name, m in model.named_modules():
-        if not isinstance(m, torch.nn.ModuleList) or not (name == "layers" or name.endswith(".layers")):
+        if not isinstance(m, torch.nn.ModuleList) or not (
+            name == "layers" or name.endswith(".layers")
+        ):
             continue
         nb = sum(_nbytes(p) for p in m.parameters() if p.device.type == "cuda")
         if nb > best_bytes:
             best, best_bytes = m, nb
     if best is None:
         return []
-    return [l for l in best if isinstance(l, torch.nn.Module) and type(l).__name__ != "PPMissingLayer"]
+    return [
+        l
+        for l in best
+        if isinstance(l, torch.nn.Module) and type(l).__name__ != "PPMissingLayer"
+    ]
 
 
 def _place(dspan, item):
     if item[0] == "param":
         _, name, shape, dtype, off, nb = item
-        return dspan[off:off + nb].view(dtype).view(shape)
+        return dspan[off : off + nb].view(dtype).view(shape)
     _, mod, attr, shape, dtype, off, nb, inner = item
-    return dspan[off:off + nb].view(dtype).view(shape)
+    return dspan[off : off + nb].view(dtype).view(shape)
 
 
 def _point(layer, dspan, layout, limit=None) -> None:
@@ -231,14 +253,18 @@ def _point(layer, dspan, layout, limit=None) -> None:
             _, mod, attr, shape, dtype, off, nb, inner = item
             setattr(mod, attr, _place(dspan, item))
             for name, pshape, pdtype, delta, pnb in inner:
-                layer.get_parameter(name).data = dspan[off + delta:off + delta + pnb].view(pdtype).view(pshape)
+                layer.get_parameter(name).data = (
+                    dspan[off + delta : off + delta + pnb].view(pdtype).view(pshape)
+                )
 
 
 def _pfonly_empty(layer, layout, dec) -> None:
     """The layer's prefill-only weights (placed at or after dec) point at empty tensors."""
     for item in layout:
         if item[0] == "param" and item[4] >= dec:
-            layer.get_parameter(item[1]).data = torch.empty(0, dtype=item[3], device=STATE["device"])
+            layer.get_parameter(item[1]).data = torch.empty(
+                0, dtype=item[3], device=STATE["device"]
+            )
 
 
 def _point_back(i: int) -> None:
@@ -255,14 +281,21 @@ def bind_model(model) -> None:
     if not ENABLED or "layers" in STATE or STATE["phase"] != "load":
         return
     layers = _decoder_layers(model)
+    _pack_resident(layers)
     entries = []
     for layer in layers:
         lay, off, slack = [], 0, 0
         for name, p in layer.named_parameters():
             if isinstance(p, torch.nn.parameter.UninitializedParameter):
-                slack += _align(_nbytes(p))  # GGUF qweight: made by the load, taken in after it
+                slack += _align(
+                    _nbytes(p)
+                )  # GGUF qweight: made by the load, taken in after it
                 continue
-            if p.device.type != "cuda" or not p.is_contiguous() or any(w in name for w in SKIP + PFONLY):
+            if (
+                p.device.type != "cuda"
+                or not p.is_contiguous()
+                or any(w in name for w in SKIP + PFONLY + RESIDENT)
+            ):
                 continue
             if _nbytes(p) < MIN_BYTES:
                 # room for it in case the loading stacks it into a fused
@@ -290,17 +323,57 @@ def bind_model(model) -> None:
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
         _hook_entries(layer, idx, {item[1] for item in lay})
-    STATE.update(layers=[e[0] for e in entries], layouts=[e[1] for e in entries],
-                 spans=[e[2] for e in entries], dev_spans=dev_spans, dev_full=list(dev_spans),
-                 device=device, counts=dict(owners=0, grown=0, moved=0, dropped=0, aliases=0, early=0))
+    STATE.update(
+        layers=[e[0] for e in entries],
+        layouts=[e[1] for e in entries],
+        spans=[e[2] for e in entries],
+        dev_spans=dev_spans,
+        dev_full=list(dev_spans),
+        device=device,
+        counts=dict(owners=0, grown=0, moved=0, dropped=0, aliases=0, early=0),
+    )
     for idx, (layer, _, _) in enumerate(entries):
         for m in layer.modules():
             m._kt_lend_layer = idx
     # the one-layer slots now, while the card is empty (the spans' room
     # covers what moving the owners in adds)
-    STATE["slots"] = [scratch_empty((max(STATE["spans"]),), torch.uint8, device) for _ in range(2)]
-    _log(f"{len(entries)} decoder layers, {sum(STATE['spans']) / 1e9:.3f} GB of weights in per-layer "
-         f"spans on {device} (min parameter {MIN_BYTES / 1e6:.1f} MB)")
+    STATE["slots"] = [
+        scratch_empty((max(STATE["spans"]),), torch.uint8, device) for _ in range(2)
+    ]
+    _log(
+        f"{len(entries)} decoder layers, {sum(STATE['spans']) / 1e9:.3f} GB of weights in per-layer "
+        f"spans on {device} (min parameter {MIN_BYTES / 1e6:.1f} MB)"
+    )
+
+
+def _pack_resident(layers) -> None:
+    """The layers' KT_PREFILL_LEND_RESIDENT parameters into one buffer, so their
+    originals are freed with the lent ones."""
+    if not RESIDENT:
+        return
+    # the name first: a GGUF qweight is an uninitialized parameter until the load
+    found = [
+        (layer, name, p)
+        for layer in layers
+        for name, p in layer.named_parameters()
+        if any(w in name for w in RESIDENT)
+        and not isinstance(p, torch.nn.parameter.UninitializedParameter)
+        and p.device.type == "cuda"
+        and p.is_contiguous()
+    ]
+    if not found:
+        return
+    offs, total = [], 0
+    for _, _, p in found:
+        offs.append(total)
+        total = _align(total + _nbytes(p))
+    buf = torch.empty(total, dtype=torch.uint8, device=found[0][2].device)
+    for (layer, name, p), off in zip(found, offs):
+        view = buf[off : off + _nbytes(p)].view(p.dtype).view(p.shape)
+        view.copy_(p)
+        p.data = view
+    STATE["resident"] = buf
+    _log(f"{len(found)} parameters resident in one buffer of {total / 1e6:.1f} MB")
 
 
 def _hook_entries(layer, idx: int, lent) -> None:
@@ -313,7 +386,11 @@ def _hook_entries(layer, idx: int, lent) -> None:
             child._kt_lend_idx = idx
             child.register_forward_pre_hook(_enter_hook)
     for name in dir(type(layer)):
-        if name.startswith("forward") and name != "forward" and callable(getattr(type(layer), name)):
+        if (
+            name.startswith("forward")
+            and name != "forward"
+            and callable(getattr(type(layer), name))
+        ):
             setattr(layer, name, _entering(getattr(layer, name), idx))
 
 
@@ -346,13 +423,20 @@ def _owners_after_load(layer, lay):
         for attr, val in list(vars(mod).items()):
             if attr.startswith("_parameters") or attr.startswith("_buffers"):
                 continue
-            if not torch.is_tensor(val) or isinstance(val, torch.nn.Parameter) or not val.is_cuda:
+            if (
+                not torch.is_tensor(val)
+                or isinstance(val, torch.nn.Parameter)
+                or not val.is_cuda
+            ):
                 continue
             if not val.is_contiguous() or _nbytes(val) < MIN_BYTES:
                 continue
             lo, hi = val.data_ptr(), val.data_ptr() + _nbytes(val)
-            inner = [(n, p.data_ptr() - lo) for n, p in params.items()
-                     if p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()]
+            inner = [
+                (n, p.data_ptr() - lo)
+                for n, p in params.items()
+                if p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()
+            ]
             if any(n in lent for n, _ in inner):
                 found.append((mod, attr, val, inner))
     return found
@@ -371,9 +455,19 @@ def _relayout(i: int, counts) -> None:
     inner_names = {n for _, _, _, inner in found for n, _ in inner}
     new, off = [], 0
     for mod, attr, val, inner in found:
-        recs = [(n, tuple(layer.get_parameter(n).shape), layer.get_parameter(n).dtype, d,
-                 _nbytes(layer.get_parameter(n))) for n, d in inner]
-        new.append(("owner", mod, attr, tuple(val.shape), val.dtype, off, _nbytes(val), recs))
+        recs = [
+            (
+                n,
+                tuple(layer.get_parameter(n).shape),
+                layer.get_parameter(n).dtype,
+                d,
+                _nbytes(layer.get_parameter(n)),
+            )
+            for n, d in inner
+        ]
+        new.append(
+            ("owner", mod, attr, tuple(val.shape), val.dtype, off, _nbytes(val), recs)
+        )
         off = _align(off + _nbytes(val))
         counts["owners"] += 1
     mod = val = inner = None  # the owners' originals go when the layer is pointed away
@@ -384,16 +478,26 @@ def _relayout(i: int, counts) -> None:
     names = _lent_names(lay)
     # what the loading made anew (a repack under another name) and is big
     # enough is lent too
-    names += [n for n, q in params.items() if n not in names and _ready(q) and q.is_cuda and q.is_contiguous()
-              and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP)
-              and (STATE.get("final") or not any(w in n for w in PFONLY))]
+    names += [
+        n
+        for n, q in params.items()
+        if n not in names
+        and _ready(q)
+        and q.is_cuda
+        and q.is_contiguous()
+        and _nbytes(q) >= MIN_BYTES
+        and not any(w in n for w in SKIP + RESIDENT)
+        and (STATE.get("final") or not any(w in n for w in PFONLY))
+    ]
     # prefill-only weights only in after_load's final pass: a layer laid out
     # again during the load (after_module) keeps them in its span, or the
     # final pass would find them emptied
     pfonly = PFONLY if STATE.get("final") else []
-    names = ([n for n in names if not any(w in n for w in IDLE + pfonly)]
-             + [n for n in names if any(w in n for w in IDLE)]
-             + [n for n in names if any(w in n for w in pfonly)])
+    names = (
+        [n for n in names if not any(w in n for w in IDLE + pfonly)]
+        + [n for n in names if any(w in n for w in IDLE)]
+        + [n for n in names if any(w in n for w in pfonly)]
+    )
     active = pfo = None
     for name in names:
         q = params.get(name)
@@ -401,7 +505,13 @@ def _relayout(i: int, counts) -> None:
             active = off
         if pfo is None and any(w in name for w in pfonly):
             pfo = off
-        if name in inner_names or q is None or not _ready(q) or not q.is_cuda or not q.is_contiguous():
+        if (
+            name in inner_names
+            or q is None
+            or not _ready(q)
+            or not q.is_cuda
+            or not q.is_contiguous()
+        ):
             if q is None:
                 # a second name for a parameter registered under another one
                 # (alias_or_bind_derived_param: Flash-Next's *_blockscale_swizzled
@@ -426,15 +536,24 @@ def _relayout(i: int, counts) -> None:
     # prefill-only bytes the current span holds: only those come back by making
     # a smaller one (bind_model leaves them out, so a layer the load did not lay
     # out again holds none, and its span differs from dec by the bind's slack)
-    pf_held = sum(item[5] for item in new if item[0] == "param" and item[4] >= dec
-                  and lo <= layer.get_parameter(item[1]).data_ptr() < hi)
+    pf_held = sum(
+        item[5]
+        for item in new
+        if item[0] == "param"
+        and item[4] >= dec
+        and lo <= layer.get_parameter(item[1]).data_ptr() < hi
+    )
     # through pinned host memory, back into the same span (the bind left
     # room for the small parameters an owner may take in): freeing a span
     # and making a slightly larger one cut a new segment per layer on one
     # Flash-Next rank, and the card ran out after ~20 layers
     (host, reused), src = _pinned_bounce(span), None
     for item in new:
-        src = getattr(item[1], item[2]) if item[0] == "owner" else layer.get_parameter(item[1])
+        src = (
+            getattr(item[1], item[2])
+            if item[0] == "owner"
+            else layer.get_parameter(item[1])
+        )
         _place(host, item).copy_(src)
     _point(layer, host, new)
     STATE["dev_spans"][i] = None
@@ -459,10 +578,12 @@ def _relayout(i: int, counts) -> None:
         STATE["dev_full"][i] = dspan
         counts["grown"] += 1
     if DEBUG:
-        _log(f"relayout layer {i} on {device}: span {STATE['spans'][i]} -> {span} bytes (decode {dec}, "
-             f"held {held}, prefill-only in it {pf_held}) "
-             f"({'in place' if in_place else 'new span'}), free {torch.cuda.mem_get_info(device)[0] >> 20} MiB, "
-             f"torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
+        _log(
+            f"relayout layer {i} on {device}: span {STATE['spans'][i]} -> {span} bytes (decode {dec}, "
+            f"held {held}, prefill-only in it {pf_held}) "
+            f"({'in place' if in_place else 'new span'}), free {torch.cuda.mem_get_info(device)[0] >> 20} MiB, "
+            f"torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB"
+        )
     dspan.copy_(host[:dec])
     _point(layer, dspan, new, limit=dec)
     if dec < span:
@@ -488,8 +609,14 @@ def after_module(module) -> None:
         return
     full = STATE["dev_full"][i]
     lo, hi = full.data_ptr(), full.data_ptr() + full.numel()
-    if all(lo <= q.data_ptr() < hi for n, q in STATE["layers"][i].named_parameters()
-           if _ready(q) and q.is_cuda and _nbytes(q) >= MIN_BYTES and not any(w in n for w in SKIP + PFONLY)):
+    if all(
+        lo <= q.data_ptr() < hi
+        for n, q in STATE["layers"][i].named_parameters()
+        if _ready(q)
+        and q.is_cuda
+        and _nbytes(q) >= MIN_BYTES
+        and not any(w in n for w in SKIP + PFONLY + RESIDENT)
+    ):
         return
     _relayout(i, dict(owners=0, grown=0, moved=0, dropped=0, aliases=0))
     STATE["counts"]["early"] += 1
@@ -504,8 +631,10 @@ def after_load() -> None:
     counts = STATE["counts"]
     device = STATE["device"]
     if DEBUG:
-        _log(f"after_load on {device} (current {torch.cuda.current_device()}): free "
-             f"{torch.cuda.mem_get_info(device)[0] >> 20} MiB, torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB")
+        _log(
+            f"after_load on {device} (current {torch.cuda.current_device()}): free "
+            f"{torch.cuda.mem_get_info(device)[0] >> 20} MiB, torch reserved {torch.cuda.memory_reserved(device) >> 20} MiB"
+        )
     STATE["final"] = True
     for i in range(len(STATE["layers"])):
         _relayout(i, counts)
@@ -515,33 +644,50 @@ def after_load() -> None:
         total += span
     host = _pinned_empty(total)
     kept = STATE.pop("relayout_host", {})
-    for i, (base, span, dspan) in enumerate(zip(bases, STATE["spans"], STATE["dev_spans"])):
-        host[base:base + span].copy_(kept[i] if i in kept else dspan)
+    for i, (base, span, dspan) in enumerate(
+        zip(bases, STATE["spans"], STATE["dev_spans"])
+    ):
+        host[base : base + span].copy_(kept[i] if i in kept else dspan)
     del kept
     if PFONLY:
         dec_total = sum(d.numel() for d in STATE["dev_spans"])
-        _log(f"prefill-only weights ({','.join(PFONLY)}): {(total - dec_total) / 1e9:.3f} GB kept out of the "
-             f"decode spans ({dec_total / 1e9:.3f} GB resident)")
-    STATE.update(host=host, bases=bases, nbytes=total,
-                 dec_nbytes=sum(d.numel() for d in STATE["dev_spans"]))
+        _log(
+            f"prefill-only weights ({','.join(PFONLY)}): {(total - dec_total) / 1e9:.3f} GB kept out of the "
+            f"decode spans ({dec_total / 1e9:.3f} GB resident)"
+        )
+    STATE.update(
+        host=host,
+        bases=bases,
+        nbytes=total,
+        dec_nbytes=sum(d.numel() for d in STATE["dev_spans"]),
+    )
     maxspan = max(STATE["spans"])
     if STATE["slots"][0].numel() < maxspan:
         STATE["slots"] = None
-        STATE["slots"] = [scratch_empty((maxspan,), torch.uint8, device) for _ in range(2)]
+        STATE["slots"] = [
+            scratch_empty((maxspan,), torch.uint8, device) for _ in range(2)
+        ]
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     _tms().pause(TAG_SCRATCH)
     STATE["phase"] = "decode"
-    _log(f"weights {total / 1e9:.3f} GB mirrored ({counts['owners']} fused owners moved in, {counts['grown']} spans "
-         f"outgrown, {counts['moved']} parameters rebound or made by the loading taken in, {counts['aliases']} aliases, "
-         f"{counts['dropped']} gone, "
-         f"{counts['early']} layers taken back during the load"
-         + (f"; gone: {', '.join(sorted(counts['gone_names'])[:6])}" if counts.get("gone_names") else "")
-         + f"); scratch {STATE['scratch_bytes'] / 1e9:.3f} GB released "
-         f"until the first long prefill")
+    _log(
+        f"weights {total / 1e9:.3f} GB mirrored ({counts['owners']} fused owners moved in, {counts['grown']} spans "
+        f"outgrown, {counts['moved']} parameters rebound or made by the loading taken in, {counts['aliases']} aliases, "
+        f"{counts['dropped']} gone, "
+        f"{counts['early']} layers taken back during the load"
+        + (
+            f"; gone: {', '.join(sorted(counts['gone_names'])[:6])}"
+            if counts.get("gone_names")
+            else ""
+        )
+        + f"); scratch {STATE['scratch_bytes'] / 1e9:.3f} GB released "
+        f"until the first long prefill"
+    )
 
 
 # -- phase swap ------------------------------------------------------------------
+
 
 def _threshold() -> int:
     """Rows from which a prefill does not need the resident MoE weights: the
@@ -549,7 +695,9 @@ def _threshold() -> int:
     (GLM-5.3's) the full-GPU prefill's --kt-gpu-prefill-token-threshold."""
     if "threshold" not in STATE:
         try:
-            from sglang.srt.layers.moe.kt_exl3_stream_prefill import THRESHOLD as _exl3_t
+            from sglang.srt.layers.moe.kt_exl3_stream_prefill import (
+                THRESHOLD as _exl3_t,
+            )
         except ImportError:
             _exl3_t = 0
         if _exl3_t > 0:  # the EXL3 streamed prefill (kt_exl3_stream_prefill.py)
@@ -559,9 +707,10 @@ def _threshold() -> int:
             from sglang.srt.layers.moe.kt_stream_prefill import STREAM_THRESHOLD as t
         except ImportError:
             try:
-                from sglang.srt.server_args import get_global_server_args
-
-                t = int(getattr(get_global_server_args(), "kt_gpu_prefill_token_threshold", 0) or 0)
+                t = int(
+                    getattr(_server_args(), "kt_gpu_prefill_token_threshold", 0)
+                    or 0
+                )
             except Exception:
                 t = 0
         STATE["threshold"] = t
@@ -581,11 +730,40 @@ def _streamed(forward_batch) -> bool:
 
 def _chunk() -> int:
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_schedule
 
-        return int(get_global_server_args().chunked_prefill_size or 0)
+        return int(get_schedule().chunked_prefill_size or 0)
+    except ImportError:
+        pass
     except Exception:
         return 0
+    try:
+        return int(_server_args().chunked_prefill_size or 0)
+    except Exception:
+        return 0
+
+
+def _server_args():
+    """The server args: SGLang main's runtime_context, else a release's global."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        return get_server_args()
+    except ImportError:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args()
+
+
+def _tp_rank() -> int:
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        return get_parallel().tp_rank
+    except ImportError:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank()
 
 
 def _seq_len(forward_batch) -> int:
@@ -608,9 +786,7 @@ def _seq_len(forward_batch) -> int:
 def _rank() -> int:
     if "rank" not in STATE:
         try:
-            from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-            STATE["rank"] = get_tensor_model_parallel_rank()
+            STATE["rank"] = _tp_rank()
         except Exception:
             STATE["rank"] = STATE["device"].index
     return STATE["rank"]
@@ -641,9 +817,15 @@ def _fw_close() -> None:
     except Exception:
         pass
     kept = STATE.get("kept_at_start", 0)
-    rec = dict(fw, free=int(STATE["pf_free"] + kept), loan=loan, resv=int(resv - STATE["pf_base"]),
-               alloc=int(alloc - STATE.get("pf_abase", 0) + kept), chunk=_chunk(),
-               window=STATE.get("to_prefill", 0))
+    rec = dict(
+        fw,
+        free=int(STATE["pf_free"] + kept),
+        loan=loan,
+        resv=int(resv - STATE["pf_base"]),
+        alloc=int(alloc - STATE.get("pf_abase", 0) + kept),
+        chunk=_chunk(),
+        window=STATE.get("to_prefill", 0),
+    )
     try:
         import json
 
@@ -657,16 +839,21 @@ def _write_hint(rank: int) -> None:
     import json
 
     rows = STATE.get("pf_rows", 0)
-    chunk = _chunk()
+    chunk = launch_chunk = _chunk()
     # under the prefill plan the launch chunk is its cap; the lend's own chunk is
     # the one this hint is about (with the cap here, a 12,288-row window kept the
     # cap on record and GLM's next launch took 32,768 as its own chunk, 10-16)
-    if os.environ.get("KT_PREFILL_PLAN", "0") == "1":
+    planned = os.environ.get("KT_PREFILL_PLAN", "0") == "1"
+    if planned:
         chunk = int(os.environ.get("KT_PREFILL_PLAN_SAFE", "0") or 0) or chunk
     if not HINT or rows < 2048 or chunk <= 0:
         return
     growth = STATE["pf_peak"] - STATE["pf_base"]
-    per_tok = growth / rows + STATE["scratch_chunk_bytes"] / chunk
+    # the chunk-sized scratch is sized for the launch chunk (the plan's cap): spread
+    # over the lend's own chunk it made a row 1.9x as costly on Flash-Next (558
+    # against 295 KB at 18,432 rows, 10-17), and the next launch's plan began with
+    # a first-window room below zero
+    per_tok = growth / rows + STATE["scratch_chunk_bytes"] / launch_chunk
     room = STATE["pf_free"] - growth - MARGIN
     hint = chunk + int(room / per_tok) if per_tok > 0 else chunk
     # the cost per token grows with the rows (Flash-Next 371 -> 417 KB from
@@ -677,7 +864,15 @@ def _write_hint(rank: int) -> None:
     # 6K-token window on Vision-Exp hinted 22528 from chunk 16384; the full
     # 16384 rows then left no room): it may only lower the chunk
     keep_min = True
-    if rows < 4096:
+    if planned and rows > chunk:
+        # a window wider than the lend's own chunk ran on the plan's reading of
+        # free memory and the KV pages lent to it, which the room here leaves
+        # out: it says nothing about the lend's chunk (10-17 Flash-Next: one
+        # 35,000-row window peaked 9.22 GB with 6.87 GB free and took the chunk
+        # from 6,144 to 2,048)
+        hint = min(chunk, STATE.get("hint_min", chunk))
+        keep_min = False
+    elif rows < 4096:
         # too few rows to say anything about the chunk; still a point below
         hint = min(chunk, STATE.get("hint_min", chunk))
         keep_min = False
@@ -698,21 +893,37 @@ def _write_hint(rank: int) -> None:
         STATE["hint_min"] = hint
     # allocated bytes a row, which unlike the reserved peak does not grow with
     # the free memory (kt_prefill_plan's per-row cost; the largest of the launch)
-    alloc_row = int(((STATE.get("win_alloc_peak") or torch.cuda.max_memory_allocated(STATE["device"]))
-                     - STATE.get("pf_abase", 0)) / rows)
+    alloc_row = int(
+        (
+            (
+                STATE.get("win_alloc_peak")
+                or torch.cuda.max_memory_allocated(STATE["device"])
+            )
+            - STATE.get("pf_abase", 0)
+        )
+        / rows
+    )
     STATE["alloc_row_max"] = max(STATE.get("alloc_row_max", 0), alloc_row)
-    rec = {"chunk": hint, "current_chunk": chunk, "rows_seen": rows, "alloc_per_row": STATE["alloc_row_max"],
-           # free at a window's start minus free in decode before it: the plan's step
-           # from the live decode free memory, known to the next launch's first request.
-           # Without the scratch earlier windows kept: that scratch lives in this
-           # process only, and a new launch's first window starts without it
-           "pf_delta_mb": STATE.get("pf_delta_seen", STATE.get("pf_delta", 0)) >> 20,
-           "free_at_prefill_mb": STATE["pf_free"] >> 20, "peak_growth_mb": growth >> 20,
-           "margin_mb": MARGIN >> 20, "bytes_per_token": round(per_tok),
-           "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20,
-           # the longest sequence of the window, and the full KV pool the server
-           # got (kt_lend_swa_ratio sizes an SWA pool from it, not from the cap)
-           "seq_seen": STATE.get("pf_seq", 0), "full_tokens": STATE.get("full_tokens", 0)}
+    rec = {
+        "chunk": hint,
+        "current_chunk": chunk,
+        "rows_seen": rows,
+        "alloc_per_row": STATE["alloc_row_max"],
+        # free at a window's start minus free in decode before it: the plan's step
+        # from the live decode free memory, known to the next launch's first request.
+        # Without the scratch earlier windows kept: that scratch lives in this
+        # process only, and a new launch's first window starts without it
+        "pf_delta_mb": STATE.get("pf_delta_seen", STATE.get("pf_delta", 0)) >> 20,
+        "free_at_prefill_mb": STATE["pf_free"] >> 20,
+        "peak_growth_mb": growth >> 20,
+        "margin_mb": MARGIN >> 20,
+        "bytes_per_token": round(per_tok),
+        "scratch_chunk_mb": STATE["scratch_chunk_bytes"] >> 20,
+        # the longest sequence of the window, and the full KV pool the server
+        # got (kt_lend_swa_ratio sizes an SWA pool from it, not from the cap)
+        "seq_seen": STATE.get("pf_seq", 0),
+        "full_tokens": STATE.get("full_tokens", 0),
+    }
     # the window as a point of the cost per row against the sequence length,
     # merged with the points earlier launches of this setup left (one per
     # power-of-two sequence bucket, the costlier kept): kt_lend_table builds
@@ -733,17 +944,23 @@ def _write_hint(rank: int) -> None:
         bucket = seq.bit_length()
         old = points.get(bucket)
         if old is None or per_tok > old["per_row"]:
-            points[bucket] = {"seq": seq, "per_row": round(per_tok), "free": STATE["pf_free"],
-                              "rows": rows}
+            points[bucket] = {
+                "seq": seq,
+                "per_row": round(per_tok),
+                "free": STATE["pf_free"],
+                "rows": rows,
+            }
     STATE["points"] = points
     rec["points"] = points
     with open(path, "w") as f:
         json.dump(rec, f)
     if STATE.get("hint_logged") != hint:
         STATE["hint_logged"] = hint
-        _log(f"chunk hint {hint} (now {chunk}): {rows} rows peaked {growth / 1e9:.2f} GB above the "
-             f"prefill baseline with {STATE['pf_free'] / 1e9:.2f} GB free, {per_tok / 1e3:.0f} KB a token "
-             f"with the chunk-sized scratch, margin {MARGIN / 1e9:.2f} GB")
+        _log(
+            f"chunk hint {hint} (now {chunk}): {rows} rows peaked {growth / 1e9:.2f} GB above the "
+            f"prefill baseline with {STATE['pf_free'] / 1e9:.2f} GB free, {per_tok / 1e3:.0f} KB a token "
+            f"with the chunk-sized scratch, margin {MARGIN / 1e9:.2f} GB"
+        )
 
 
 def table_chunk(prefix: int, table: Optional[dict] = None) -> Optional[int]:
@@ -802,8 +1019,11 @@ def before_forward(forward_batch) -> None:
     # SWA pages handed back since the last forward are mapped before it runs; a
     # window that opens maps them after the weights have left (KT_PREFILL_SWA_LEND)
     m = _kv_mod()
-    if m is not None and not (streamed and STATE["phase"] == "decode") \
-            and any(getattr(m, "SWA", {}).get("pending") or ()):
+    if (
+        m is not None
+        and not (streamed and STATE["phase"] == "decode")
+        and any(getattr(m, "SWA", {}).get("pending") or ())
+    ):
         m.swa_flush("forward")
     if streamed and STATE["phase"] == "prefill":
         _fw_close()
@@ -821,6 +1041,10 @@ def before_forward(forward_batch) -> None:
     elif streamed and STATE["phase"] == "decode":
         t = time.perf_counter()
         dev = STATE["device"]
+        # the hot experts in the KV pool's free pages (KT_KV_HOT_LEND) give them
+        # back before anything is measured
+        if m is not None and hasattr(m, "hot_release"):
+            m.hot_release("window start")
         # free memory in decode, the KV pool and the graphs made: what is gone
         # from it when the weights come back was left behind by this prefill
         STATE["dec_free"] = torch.cuda.mem_get_info(dev)[0]
@@ -828,6 +1052,9 @@ def before_forward(forward_batch) -> None:
         if DEBUG and not STATE.get("history"):
             torch.cuda.memory._record_memory_history(max_entries=500000)
             STATE["history"] = True
+        # Overlap scheduling may leave decode readers on these spans.
+        # TMS pause unmaps them without waiting for outstanding GPU work.
+        torch.cuda.synchronize(dev)
         _tms().pause(TAG_WEIGHTS)
         free_a = torch.cuda.mem_get_info(dev)[0]
         _tms().resume(TAG_SCRATCH)
@@ -844,12 +1071,16 @@ def before_forward(forward_batch) -> None:
             # what the device holds outside torch (graphs, modules, NCCL) is
             # total - free - reserved; a rise across windows is not torch's
             total = torch.cuda.mem_get_info(dev)[1]
-            _log(f"prefill window {STATE['to_prefill'] + 1} start on {dev}: free {STATE['pf_free'] >> 20} MiB, "
-                 f"torch reserved {STATE['pf_base'] >> 20} MiB, allocated "
-                 f"{torch.cuda.memory_allocated(dev) >> 20} MiB, outside torch "
-                 f"{(total - STATE['pf_free'] - STATE['pf_base']) >> 20} MiB")
+            _log(
+                f"prefill window {STATE['to_prefill'] + 1} start on {dev}: free {STATE['pf_free'] >> 20} MiB, "
+                f"torch reserved {STATE['pf_base'] >> 20} MiB, allocated "
+                f"{torch.cuda.memory_allocated(dev) >> 20} MiB, outside torch "
+                f"{(total - STATE['pf_free'] - STATE['pf_base']) >> 20} MiB"
+            )
         torch.cuda.reset_peak_memory_stats(dev)
-        STATE["pf_outside"] = torch.cuda.mem_get_info(dev)[1] - STATE["pf_free"] - STATE["pf_base"]
+        STATE["pf_outside"] = (
+            torch.cuda.mem_get_info(dev)[1] - STATE["pf_free"] - STATE["pf_base"]
+        )
         STATE["pf_abase"] = torch.cuda.memory_allocated(dev)
         if "full_tokens" not in STATE:
             # the full KV pool the server got, from the ModelRunner that calls
@@ -859,14 +1090,22 @@ def before_forward(forward_batch) -> None:
                 import inspect
 
                 runner = inspect.currentframe().f_back.f_locals.get("self")
-                STATE["full_tokens"] = int(getattr(runner, "max_total_num_tokens", 0) or 0)
+                STATE["full_tokens"] = int(
+                    getattr(runner, "max_total_num_tokens", 0) or 0
+                )
             except Exception:
                 STATE["full_tokens"] = 0
         if SNAPSHOT and not STATE.get("snap_done") and rows >= SNAPSHOT_ROWS:
-            torch.cuda.memory._record_memory_history(enabled="all", context="all", stacks="python",
-                                                     max_entries=4_000_000)
+            torch.cuda.memory._record_memory_history(
+                enabled="all", context="all", stacks="python", max_entries=4_000_000
+            )
             STATE["snap_on"] = True
-        STATE.update(phase="prefill", pf_issued=set(), pf_rows=rows, pf_seq=_seq_len(forward_batch))
+        STATE.update(
+            phase="prefill",
+            pf_issued=set(),
+            pf_rows=rows,
+            pf_seq=_seq_len(forward_batch),
+        )
         # free at a window's start minus free in decode just before it (weights out,
         # scratch in): kt_prefill_plan adds it to the live decode free memory
         STATE["pf_delta"] = STATE["pf_free"] - STATE["dec_free"]
@@ -882,13 +1121,22 @@ def before_forward(forward_batch) -> None:
         if m is not None and hasattr(m, "swa_flush"):
             m.swa_flush("window start")
         if STATE["to_prefill"] in (1, 10, 100, 1000):
-            _log(f"to prefill in {(time.perf_counter() - t) * 1e3:.1f} ms ({STATE['to_prefill']} so far)")
+            _log(
+                f"to prefill in {(time.perf_counter() - t) * 1e3:.1f} ms ({STATE['to_prefill']} so far)"
+            )
     elif not streamed and STATE["phase"] == "prefill":
         end_window()
     elif STATE["phase"] == "decode":
         m = _kv_mod()
         if m is not None and getattr(m, "SWA_ENABLED", False):
             m.swa_tick()
+        if m is not None and getattr(m, "HOT", False):
+            # the KV pool's free pages to more hot experts (kt_kv_hot_lend)
+            import inspect
+
+            from sglang.srt.layers.moe import kt_kv_hot_lend
+
+            kt_kv_hot_lend.tick(inspect.currentframe().f_back.f_locals.get("self"))
 
 
 def _kv_mod():
@@ -929,13 +1177,17 @@ def end_window() -> None:
         t = time.perf_counter()
         dev = STATE["device"]
         _fw_close()
-        STATE["pf_peak"] = STATE.get("win_resv_peak") or torch.cuda.max_memory_reserved(dev)
+        STATE["pf_peak"] = STATE.get("win_resv_peak") or torch.cuda.max_memory_reserved(
+            dev
+        )
         if STATE.get("snap_on"):
             path = f"{SNAPSHOT}-{dev.index}.pickle"
             torch.cuda.memory._dump_snapshot(path)
             torch.cuda.memory._record_memory_history(enabled=None)
             STATE.update(snap_on=False, snap_done=True)
-            _log(f"allocation history of window {STATE['to_prefill']} ({STATE.get('pf_rows', 0)} rows) in {path}")
+            _log(
+                f"allocation history of window {STATE['to_prefill']} ({STATE.get('pf_rows', 0)} rows) in {path}"
+            )
         if DEBUG:
             # one line a window for fitting the growth to rows and sequence
             # length; "outside torch" is how much more the device held outside
@@ -943,23 +1195,28 @@ def end_window() -> None:
             # graphs; a transient that is gone by the end does not show)
             free_now, total = torch.cuda.mem_get_info(dev)
             outside = total - free_now - torch.cuda.memory_reserved(dev)
-            _log(f"prefill window {STATE['to_prefill']} on {dev}: rows {STATE.get('pf_rows', 0)}, "
-                 f"seq {STATE.get('pf_seq', 0)}, peak growth "
-                 f"{(STATE['pf_peak'] - STATE['pf_base']) >> 20} MiB of {STATE['pf_free'] >> 20} MiB free "
-                 f"(allocated {(torch.cuda.max_memory_allocated(dev) - STATE.get('pf_abase', 0)) >> 20} MiB), "
-                 f"outside torch {(outside - STATE['pf_outside']) >> 20:+d} MiB, full pool "
-                 f"{STATE.get('full_tokens', 0)}")
+            _log(
+                f"prefill window {STATE['to_prefill']} on {dev}: rows {STATE.get('pf_rows', 0)}, "
+                f"seq {STATE.get('pf_seq', 0)}, peak growth "
+                f"{(STATE['pf_peak'] - STATE['pf_base']) >> 20} MiB of {STATE['pf_free'] >> 20} MiB free "
+                f"(allocated {(torch.cuda.max_memory_allocated(dev) - STATE.get('pf_abase', 0)) >> 20} MiB), "
+                f"outside torch {(outside - STATE['pf_outside']) >> 20:+d} MiB, full pool "
+                f"{STATE.get('full_tokens', 0)}"
+            )
         try:
-            from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-            rank = get_tensor_model_parallel_rank()
+            rank = _tp_rank()
         except Exception:
             rank = dev.index
+        # Prefill compute/copy streams may still read scratch mappings.
+        # Finish those reads before rebinding weights and unmapping scratch.
+        torch.cuda.synchronize(dev)
         _leave()
         torch.cuda.empty_cache()
         free_c = torch.cuda.mem_get_info(dev)[0]
         _tms().pause(TAG_SCRATCH)
-        grew = max(0, torch.cuda.mem_get_info(dev)[0] - free_c) - STATE.get("scratch_at_start", 0)
+        grew = max(0, torch.cuda.mem_get_info(dev)[0] - free_c) - STATE.get(
+            "scratch_at_start", 0
+        )
         if grew > (16 << 20) and STATE.get("pf_delta") is not None:
             # the scratch keeps what this window first made in it (GLM-5.3's 2.11 GiB
             # prefill slot, a lent CUTLASS workspace): the next window starts with that
@@ -970,15 +1227,17 @@ def end_window() -> None:
             # plan adds scratch_kept back to their free memory, and their records
             # add it to free and cost, as in a first window that had to make it
             # (counted on both sides, a second 35K got 6 chunks of 6,144 against
-            # the first's 5 of 7,168 on V4.1-1017, 10-21)
+            # the first's 5 of 7,168, 10-21)
             STATE["pf_delta"] -= grew
             STATE["scratch_kept"] = STATE.get("scratch_kept", 0) + grew
             STATE["pf_free"] -= grew
             STATE["pf_peak"] -= grew
             if STATE.get("win_alloc_peak"):
                 STATE["win_alloc_peak"] -= grew
-            _log(f"the scratch kept {grew >> 20} MiB made in window {STATE['to_prefill']}: the decode -> "
-                 f"window step is {STATE['pf_delta'] >> 20} MiB from now on")
+            _log(
+                f"the scratch kept {grew >> 20} MiB made in window {STATE['to_prefill']}: the decode -> "
+                f"window step is {STATE['pf_delta'] >> 20} MiB from now on"
+            )
         _write_hint(rank)
         # the free KV pages lent to this window first (kv-vmm); the sliding-window
         # pool's free pages leave again (KT_PREFILL_SWA_LEND)
@@ -989,13 +1248,17 @@ def end_window() -> None:
                 kt_kv_prefill_lend.swa_lend("end of window")
         _check_room(dev)
         _tms().resume(TAG_WEIGHTS)
-        for base, span, dspan in zip(STATE["bases"], STATE["spans"], STATE["dev_spans"]):
-            dspan.copy_(STATE["host"][base:base + dspan.numel()], non_blocking=True)
+        for base, span, dspan in zip(
+            STATE["bases"], STATE["spans"], STATE["dev_spans"]
+        ):
+            dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
         STATE["phase"] = "decode"
         STATE["to_decode"] += 1
         if STATE["to_decode"] in (1, 10, 100, 1000):
-            _log(f"to decode in {(time.perf_counter() - t) * 1e3:.1f} ms, copy queued "
-                 f"({STATE['to_decode']} so far)")
+            _log(
+                f"to decode in {(time.perf_counter() - t) * 1e3:.1f} ms, copy queued "
+                f"({STATE['to_decode']} so far)"
+            )
 
 
 def _check_room(dev) -> None:
@@ -1003,7 +1266,9 @@ def _check_room(dev) -> None:
     scratch is room they no longer have. Say how much, and stop with a reason
     instead of torch_memory_saver failing to map them (a process abort)."""
     free = torch.cuda.mem_get_info(dev)[0]
-    back = STATE.get("dec_nbytes", STATE["nbytes"])  # the decode spans (prefill-only weights stay out)
+    back = STATE.get(
+        "dec_nbytes", STATE["nbytes"]
+    )  # the decode spans (prefill-only weights stay out)
     need = back + len(STATE["spans"]) * (2 << 20)  # mapped in 2 MiB granules
     left = STATE["dec_free"] + back - free  # kept from this prefill window
     total = STATE["dec_free0"] + back - free  # since the first window
@@ -1014,17 +1279,21 @@ def _check_room(dev) -> None:
         _log(f"memory snapshot {path}")
     # DEBUG: every window, so a slow pile-up under 64 MB a window shows too
     if left > 64 << 20 or DEBUG:
-        _log(f"prefill window {STATE['to_decode'] + 1} on {dev} kept {left / 1e9:.2f} GB outside the lend "
-             f"scratch ({total / 1e9:.2f} GB since the first; the weights need {need / 1e9:.2f} GB, "
-             f"{free / 1e9:.2f} GB free)")
+        _log(
+            f"prefill window {STATE['to_decode'] + 1} on {dev} kept {left / 1e9:.2f} GB outside the lend "
+            f"scratch ({total / 1e9:.2f} GB since the first; the weights need {need / 1e9:.2f} GB, "
+            f"{free / 1e9:.2f} GB free)"
+        )
     if free < need:
         raise RuntimeError(
             f"KT_PREFILL_LEND: the weights ({need / 1e9:.2f} GB) cannot come back on {dev}: "
             f"{free / 1e9:.2f} GB free, {left / 1e9:.2f} GB was allocated during prefill outside the "
-            f"lend scratch and kept. Fewer GPU experts or a smaller KV pool leaves the room.")
+            f"lend scratch and kept. Fewer GPU experts or a smaller KV pool leaves the room."
+        )
 
 
 # -- per-layer streaming ---------------------------------------------------------
+
 
 def _prefetch(i: int) -> None:
     if i >= len(STATE["spans"]) or i in STATE["pf_issued"]:
@@ -1036,7 +1305,7 @@ def _prefetch(i: int) -> None:
         if STATE["pf_done"][k] is not None:
             cs.wait_event(STATE["pf_done"][k])
         n = STATE.get("active", {}).get(i, span)  # the idle tail stays out
-        STATE["slots"][k][:n].copy_(STATE["host"][base:base + n], non_blocking=True)
+        STATE["slots"][k][:n].copy_(STATE["host"][base : base + n], non_blocking=True)
         STATE["pf_ready"][k].record(cs)
     STATE["pf_issued"].add(i)
 
@@ -1071,10 +1340,23 @@ def _enter(i: int) -> None:
         STATE["pf_stream"].wait_stream(cur)
         _prefetch(i)
     cur.wait_event(STATE["pf_ready"][i % 2])
-    _point(STATE["layers"][i], STATE["slots"][i % 2], STATE["layouts"][i],
-           limit=STATE.get("active", {}).get(i))
+    _point(
+        STATE["layers"][i],
+        STATE["slots"][i % 2],
+        STATE["layouts"][i],
+        limit=STATE.get("active", {}).get(i),
+    )
     STATE["pf_cur"] = i
     _prefetch(i + 1)
+
+
+def enter(module) -> None:
+    """For code that reads a lent layer's weights before the layer runs (V4.1's
+    tail source KV write): the module's layer is entered now."""
+    if ENABLED and STATE["phase"] == "prefill":
+        i = getattr(module, "_kt_lend_layer", None)
+        if i is not None:
+            _enter(i)
 
 
 def _leave() -> None:

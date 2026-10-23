@@ -20,6 +20,12 @@ The KV always wins:
 The request's prompt length comes from the scheduler (note_request, by rid);
 the window's forward batch carries the rids and the sequence lengths.
 
+Outside prefill the same free pages can lend their memory to more hot experts
+(KT_KV_HOT_LEND=1, kt_kv_hot_lend.py): decode_lend keeps KT_KV_HOT_RESERVE
+tokens free and unmaps the rest the same way; restore runs the hot lend's
+release (PRE_RESTORE) before it maps anything back, and a window that opens
+takes everything back first (hot_release).
+
 The sliding-window pool of a hybrid SWA model lends the other way round
 (KT_PREFILL_SWA_LEND=1, with KT_KV_VMM=1): it must hold a whole prefill chunk,
 but decode needs only the window. So it is sized for the largest chunk the plan
@@ -40,6 +46,8 @@ import torch
 from sglang.srt.layers.moe import kt_kv_vmm
 
 ENABLED = os.environ.get("KT_PREFILL_KV_LEND", "0") == "1" and kt_kv_vmm.ENABLED
+HOT = os.environ.get("KT_KV_HOT_LEND", "0") == "1" and kt_kv_vmm.ENABLED
+PRE_RESTORE = []  # fn(why), run before lent pages are mapped back (the hot lend's slots out)
 RESERVE = int(os.environ.get("KT_PREFILL_KV_LEND_RESERVE", "4096"))  # tokens kept free beyond the prompt
 CHECK = os.environ.get("KT_PREFILL_KV_LEND_CHECK", "0") == "1"
 # KT_PREFILL_KV_LEND_VERIFY=1: every page in use when a window lends (but the
@@ -47,8 +55,8 @@ CHECK = os.environ.get("KT_PREFILL_KV_LEND_CHECK", "0") == "1"
 VERIFY = os.environ.get("KT_PREFILL_KV_LEND_VERIFY", "0") == "1"
 
 PROMPT: Dict[str, int] = {}  # rid -> prompt tokens
-STATE = {"alloc": None, "tensors": None, "lent": None, "ranges": [], "bytes": 0,
-         "windows": 0, "take_backs": 0, "unknown": 0}
+STATE = {"alloc": None, "tensors": None, "lent": None, "ranges": [], "bytes": 0, "owner": None,
+         "windows": 0, "take_backs": 0, "unknown": 0, "hot_lends": 0}
 
 
 def _log(msg: str) -> None:
@@ -144,7 +152,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
 
 def _setup(runner) -> bool:
     if STATE["alloc"] is not None:
-        return True
+        return not STATE.get("spare_only")
     if STATE.get("off"):
         return False
     STATE["off"] = True  # until set up
@@ -165,9 +173,17 @@ def _setup(runner) -> bool:
     n = int(getattr(a, "num_pages", 0) or a.size // a.page_size)
     tensors = _kv_tensors(kvp, n, a.page_size)
     if not tensors:
+        if HOT:
+            # nothing to unmap (V4.1's compressed KV in host memory): the hot lend can
+            # still take the driver's spare, and gives it back at the same windows
+            STATE.update(alloc=a, tensors=[], chunk=0, ps=a.page_size, n=n, off=False, spare_only=True)
+            _log("the hot lend takes the driver's spare only")
         return False
     chunk = max(t[2] for t in tensors)
-    STATE.update(alloc=a, tensors=tensors, chunk=chunk, ps=a.page_size, n=n, off=False)
+    # pages wholly in every tensor's device part (a split range's tail is host memory)
+    dev_pages = min(kt_kv_vmm.device_bytes(t[0]) // t[1] for t in tensors)
+    STATE.update(alloc=a, tensors=tensors, chunk=chunk, ps=a.page_size, n=n, off=False,
+                 dev_pages=dev_pages if dev_pages < n + 1 else None)
     _wrap_allocator(a)
     _log(f"{len(tensors)} K/V tensors of {kvp.__class__.__name__}, {n} pages of {a.page_size} tokens "
          f"({min(t[1] for t in tensors)}-{max(t[1] for t in tensors)} B a page per tensor), "
@@ -177,10 +193,28 @@ def _setup(runner) -> bool:
 
 
 def _free_pages(a) -> torch.Tensor:
+    """Every free page of the allocator: the free list, and the pages freed but not
+    merged into it yet (release_pages, or the paged allocator's staged_pages)."""
     parts = [a.free_pages]
     if getattr(a, "release_pages", None) is not None and len(a.release_pages):
         parts.append(a.release_pages)
+    parts += [p for p in getattr(a, "staged_pages", None) or [] if len(p)]
     return torch.cat(parts) if len(parts) > 1 else parts[0]
+
+
+def _free_count(a) -> int:
+    """len(_free_pages(a)) without the concatenation: what the allocator can hand
+    out, merging what it freed when its free list runs short."""
+    return (len(a.free_pages) + (len(a.release_pages) if getattr(a, "release_pages", None) is not None else 0)
+            + int(getattr(a, "num_staged_pages", 0) or 0))
+
+
+def _merge_free(a) -> None:
+    """The freed pages into the free list, as the allocator does when it runs short:
+    pages are taken out of the free list only, so none is left behind elsewhere."""
+    merge = getattr(a, "merge_and_sort_free", None)
+    if merge is not None:
+        merge()
 
 
 def _remaining(fb) -> Optional[int]:
@@ -220,7 +254,7 @@ def loan_estimate(scheduler, rem: int) -> int:
         if runner is None or not _setup(runner):
             return 0
     a, ps = STATE["alloc"], STATE["ps"]
-    free = len(a.free_pages) + (len(a.release_pages) if getattr(a, "release_pages", None) is not None else 0)
+    free = _free_count(a)
     if STATE["lent"] is not None:
         free += int(STATE["lent"].numel())
     keep = -(-(rem + RESERVE) // ps) + 1
@@ -230,8 +264,84 @@ def loan_estimate(scheduler, rem: int) -> int:
     return sum(max(0, pages * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
 
 
+def _release_free(keep_pages: int):
+    """Take every free page but the keep_pages lowest-numbered out of the free list
+    and unmap each chunk of a K/V tensor that holds only such pages (a device sync
+    first). (lent pages, mark [n + 2] of them, [(ti, off, len)] unmapped, bytes)."""
+    a, n = STATE["alloc"], STATE["n"]
+    _merge_free(a)
+    dev = a.free_pages.device
+    free = torch.sort(_free_pages(a)).values
+    if free.numel() <= keep_pages:
+        return None
+    cand = free[keep_pages:]
+    if STATE.get("dev_pages") is not None:
+        # a pool whose tail is host memory (dsv41_host_kv): only device pages lend
+        cand = cand[cand < STATE["dev_pages"]]
+        if cand.numel() == 0:
+            return None
+    mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
+    mark[cand] = 1
+    torch.cuda.synchronize(dev)
+    ranges, total = [], 0
+    # runs of chunks, one release call each
+    for ti, off, ln in _whole_chunks(STATE["tensors"], mark, n, dev):
+        got = kt_kv_vmm.release(STATE["tensors"][ti][0], off, ln)
+        if got > 0:
+            ranges.append((ti, off, ln))
+            total += got
+    keep_mask = mark[a.free_pages] == 0
+    a.free_pages = a.free_pages[keep_mask]
+    if getattr(a, "release_pages", None) is not None and len(a.release_pages):
+        a.release_pages = a.release_pages[mark[a.release_pages] == 0]
+    return cand, mark, ranges, total
+
+
+def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
+    """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
+    page a running request) leaves the free list and its whole chunks are unmapped,
+    when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""
+    if not HOT or STATE["lent"] is not None or runner is None:
+        return 0
+    if not _setup(runner):
+        if not STATE.get("spare_only") or min_bytes > 1:
+            return 0
+        STATE.update(lent=STATE["alloc"].free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
+        STATE["hot_lends"] += 1
+        return 1
+    a, ps = STATE["alloc"], STATE["ps"]
+    keep = -(-reserve_tokens // ps) + 1
+    free = _free_count(a)
+    if free <= keep:
+        return 0
+    if STATE.get("dev_pages") is not None:
+        free = min(free, STATE["dev_pages"])  # only device pages lend
+    est = sum(max(0, (free - keep) * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
+    if est < min_bytes and not (STATE.get("dev_pages") is not None and min_bytes <= 1):
+        return 0
+    got = _release_free(keep)
+    if got is None:
+        if STATE.get("dev_pages") is not None and min_bytes <= 1:
+            # a split pool with no free device page to lend: the driver's spare alone
+            STATE.update(lent=a.free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
+            STATE["hot_lends"] += 1
+            return 1
+        return 0
+    cand, _, ranges, total = got
+    STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")
+    STATE["hot_lends"] += 1
+    return total
+
+
+def hot_release(why: str) -> None:
+    """Give back what the hot lend holds (a window opens, the pool is cleared)."""
+    if STATE["lent"] is not None and STATE.get("owner") == "hot":
+        restore(why)
+
+
 def lend(runner, fb) -> None:
     """kt_lend.before_forward, opening a prefill window, after the weights left."""
+    hot_release("window start")
     if not ENABLED or STATE["lent"] is not None or runner is None or not _setup(runner):
         return
     from sglang.srt.layers.moe import kt_prefill_plan
@@ -249,24 +359,10 @@ def lend(runner, fb) -> None:
             _log(f"window without a known prompt length ({STATE['unknown']} so far): nothing lent")
         return
     keep_pages = -(-(rem + RESERVE) // ps) + len(fb.rids)
-    free = torch.sort(_free_pages(a)).values
-    if free.numel() <= keep_pages:
+    got = _release_free(keep_pages)
+    if got is None:
         return
-    cand = free[keep_pages:]
-    mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
-    mark[cand] = 1
-    torch.cuda.synchronize(dev)
-    ranges, total = [], 0
-    # runs of chunks, one release call each
-    for ti, off, ln in _whole_chunks(STATE["tensors"], mark, n, dev):
-        got = kt_kv_vmm.release(STATE["tensors"][ti][0], off, ln)
-        if got > 0:
-            ranges.append((ti, off, ln))
-            total += got
-    keep_mask = mark[a.free_pages] == 0
-    a.free_pages = a.free_pages[keep_mask]
-    if getattr(a, "release_pages", None) is not None and len(a.release_pages):
-        a.release_pages = a.release_pages[mark[a.release_pages] == 0]
+    cand, mark, ranges, total = got
     if VERIFY:
         # the release above synchronised; the pages hashed are in use, so never
         # in a released chunk
@@ -279,7 +375,7 @@ def lend(runner, fb) -> None:
         if isinstance(cur, torch.Tensor) and cur.numel():
             used[(cur.long() // ps).clamp(0, n + 1)] = False  # this batch writes them
         STATE["verify"] = (used, _page_hashes(used, n))
-    STATE.update(lent=cand, ranges=ranges, bytes=total)
+    STATE.update(lent=cand, ranges=ranges, bytes=total, owner="window")
     STATE["windows"] += 1
     if STATE["windows"] in (1, 2, 10, 100) or CHECK:
         _log(f"window {STATE['windows']}: {rem} prompt tokens to go, {keep_pages} pages kept, {cand.numel()} lent, "
@@ -308,11 +404,16 @@ def _page_hashes(mask, n: int) -> torch.Tensor:
 
 def restore(why: str = "end of window") -> None:
     """kt_lend.end_window before the weights come back (or an alloc that needs the pages)."""
-    if not ENABLED or STATE["lent"] is None:
+    if STATE["lent"] is None:
         return
     t0 = time.perf_counter()
     a = STATE["alloc"]
     dev = a.free_pages.device
+    owner = STATE.get("owner")
+    if owner == "hot":
+        # the slots give their memory back first (and leave the routing)
+        for fn in PRE_RESTORE:
+            fn(why)
     torch.cuda.synchronize(dev)
     torch.cuda.empty_cache()
     for ti, off, ln in STATE["ranges"]:
@@ -335,10 +436,14 @@ def restore(why: str = "end of window") -> None:
              f"{int(bad.numel())} changed{f' (pages {bad[:8].tolist()})' if bad.numel() else ''}; "
              f"{STATE['verified']} windows so far, {STATE['verify_bad']} pages changed in all")
     a.free_pages = torch.cat((a.free_pages, STATE["lent"].to(a.free_pages.dtype)))
-    if STATE["windows"] in (1, 2, 10, 100) or CHECK or why != "end of window":
+    if owner == "hot":
+        if STATE["hot_lends"] in (1, 2, 10, 100) or CHECK or why not in ("window start",):
+            _log(f"hot lend {STATE['hot_lends']}, {why}: {STATE['bytes'] / 1e9:.2f} GB mapped back, "
+                 f"{STATE['lent'].numel()} pages returned in {(time.perf_counter() - t0) * 1e3:.1f} ms")
+    elif STATE["windows"] in (1, 2, 10, 100) or CHECK or why != "end of window":
         _log(f"{why}: {STATE['bytes'] / 1e9:.2f} GB mapped back, {STATE['lent'].numel()} pages returned in "
              f"{(time.perf_counter() - t0) * 1e3:.1f} ms")
-    STATE.update(lent=None, ranges=[], bytes=0)
+    STATE.update(lent=None, ranges=[], bytes=0, owner=None)
 
 
 def _extend_pages(a, args, kw) -> int:
@@ -362,9 +467,11 @@ def _wrap_allocator(a) -> None:
         return 0 if STATE["lent"] is None else int(STATE["lent"].numel())
 
     def ensure(pages: int, why: str) -> None:
-        if STATE["lent"] is not None and pages > len(a.free_pages):
+        # the allocator merges what it freed when its free list runs short: those
+        # pages count (the paged allocator stages every freed page until then)
+        if STATE["lent"] is not None and pages > _free_count(a):
             STATE["take_backs"] += 1
-            restore(f"take back for {why} ({pages} pages needed, {len(a.free_pages)} kept)")
+            restore(f"take back for {why} ({pages} pages needed, {_free_count(a)} kept)")
 
     def alloc(need_size: int):
         ensure(-(-need_size // a.page_size), "alloc")
@@ -419,9 +526,9 @@ def _in_flight() -> int:
     if env:
         return max(1, int(env))
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.layers.moe.kt_lend import _server_args
 
-        return 1 if get_global_server_args().disable_overlap_schedule else 2
+        return 1 if _server_args().disable_overlap_schedule else 2
     except Exception:
         return 2
 
@@ -593,7 +700,7 @@ def _swa_init(allocator, pool) -> None:
 
 
 def _swa_free(a) -> int:
-    return len(a.free_pages) + (len(a.release_pages) if getattr(a, "release_pages", None) is not None else 0)
+    return _free_count(a)
 
 
 def swa_lend(why: str, force: bool = False) -> None:
@@ -611,6 +718,7 @@ def swa_lend(why: str, force: bool = False) -> None:
     if surplus <= 0 or (not force and surplus * SWA["row"] * SWA["ps"] < SWA_MIN):
         return
     t0 = time.perf_counter()
+    _merge_free(a)
     n, dev = SWA["n"], a.free_pages.device
     free = torch.sort(_free_pages(a)).values
     cand = free[keep:]

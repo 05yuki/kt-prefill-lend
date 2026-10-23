@@ -26,7 +26,7 @@ from pathlib import Path
 
 here = Path(__file__).resolve().parent
 srt = Path(sys.argv[1]) / "python/sglang/srt"
-for m in ("kt_kv_vmm.py", "kt_kv_prefill_lend.py", "kt_prefill_plan.py"):
+for m in ("kt_kv_vmm.py", "kt_kv_prefill_lend.py", "kt_prefill_plan.py", "kt_kv_hot_lend.py"):
     shutil.copy(here / m, srt / "layers/moe" / m)
     print(f"installed {srt / 'layers/moe' / m}")
 if (here / "libkv_vmm.so").exists():  # built beside the patcher: next to the module that loads it

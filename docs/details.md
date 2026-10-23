@@ -208,7 +208,15 @@ in `kv-vmm/` and `patches/`, none model-specific:
   buffers under 64 MiB) that can be unmapped and mapped again, zeroed, at the
   same addresses, so the decode CUDA graphs that read it stay valid. On torch
   2.13 the region is a `CUDAPluggableAllocator` MemPool; on older torch, whose
-  MemPool fails there, the region makes the tensors itself.
+  MemPool fails there, the region makes the tensors itself. The library also
+  makes two other kinds of range: a shadow range, whose unmapped chunks map one
+  shared zeroed chunk so a kernel may read all of it at any time (the hot
+  lend's slots, which captured graphs address whether or not they hold an
+  expert), and a split range, device memory up to a byte count and host memory
+  of one NUMA node after it, one range the GPU addresses as a whole (DeepSeek
+  V4.1's compressed KV past what the GPU holds, in the 1017 setup).
+  `KV_VMM_RELEASED_ZERO=1` makes every released chunk read as zeros instead of
+  faulting, a diagnostic for stray reads of lent pages.
 - **The loan** (`KT_PREFILL_KV_LEND=1`, `kt_kv_prefill_lend.py`). When a
   prefill window opens, the free pages beyond the request's remaining prompt
   and 4,096 tokens leave the allocator's free list and every chunk holding only
@@ -249,7 +257,12 @@ With the plan (`KT_PREFILL_SWA_LEND=1`, set for such profiles):
   handed back through the cache's own eviction (`tree_cache.evict`);
 - SGLang's chunk-cache SWA eviction counts the chunk in flight as the one
   planned for the request (`managers/schedule_batch.py`), so a request does
-  not hold every chunk's SWA until it ends.
+  not hold every chunk's SWA until it ends;
+- the plan charges a chunked request the SWA of the chunks it holds at once
+  (two under the overlap scheduler, whose next chunk is allocated before the
+  last one's slots are freed), not of its whole remaining prompt: a 512K
+  prompt held 6% of a 77K-token SWA pool throughout, while charging the rest
+  of the prompt kept it at 2,048-row chunks.
 
 What SGLang itself sizes from the launch chunk is kept at the lend's chunk: the
 pools' budget, and KT's staging buffer for CPU experts
@@ -342,6 +355,12 @@ SGLang's overlap scheduler: 2, else 1); `KT_GPU_STREAM_ROW_BLOCK` (4,096);
   rows than the chunk only lowers it.
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is refused by
   torch_memory_saver.
+- Measured one request at a time. A window's two transitions wait for the GPU
+  first (`torch.cuda.synchronize`): torch_memory_saver's CUDA pause unmaps
+  without waiting, and the overlap scheduler can still have decode readers on
+  the weights when a window opens, or prefill readers on the scratch when it
+  closes. Found and fixed by Florian Wunderlich under concurrent load; serving
+  many requests at once is otherwise not measured.
 - An extend below the streaming threshold runs with the weights back unless
   its sequence reaches `KT_PREFILL_LEND_LONG_SEQ`: a prompt's last chunk, or a
   short turn on a long conversation. The pool and the free memory are sized
@@ -358,6 +377,13 @@ SGLang's overlap scheduler: 2, else 1); `KT_GPU_STREAM_ROW_BLOCK` (4,096);
 
 - `KT_PREFILL_LEND=1` — on.
 - `KT_PREFILL_LEND_SKIP` — parameter-name substrings kept resident (`engram`).
+- `KT_PREFILL_LEND_RESIDENT` — parameter-name substrings kept resident and
+  packed into one buffer of their own at the bind (none; the V4.1-1017 setup
+  on SGLang main sets `hc_`, because its layer boundary reads the next layer's
+  hc mixing weights). Left where they were, each would keep the torch cache
+  block its lent neighbours are freed from (1.9 GB on DeepSeek V4.1). Every
+  name it matches costs its bytes of the prefill's room: on Flash-Next `hc_`
+  matches 631 MB.
 - `KT_PREFILL_LEND_MIN_BYTES` — smallest parameter lent (1 MiB).
 - `KT_PREFILL_LEND_MARGIN_MB` — room left free in the measured chunk (256;
   what a window adds outside torch's allocator measured 0-62 MiB).
@@ -513,6 +539,53 @@ loader's static placement and converges within a few hundred steps.
 Measured on Flash-Next. Other GGUF MoE models need their expert tensor names
 (`blk.N.ffn_{gate,up,down}_exps.weight`) and a kernel for their types
 (`kt_gguf_moe_multi.py` lists them).
+
+**The KV lend for the GPU's own expert method** (`kv-vmm/kt_kv_hot_lend.py`,
+`KT_KV_HOT_LEND=1`; NVFP4 and MXFP4 experts, no GGUF). The same idea on the
+plan's KV pool, without a cache: the KT wrapper's GPU method loads
+`--kt-num-gpu-experts` + `KT_KV_HOT_EXTRA` experts a layer and keeps the extra
+ones in pinned memory. Outside prefill the KV pool's free pages beyond
+`KT_KV_HOT_RESERVE` tokens (4,096) are unmapped (the plan's own loan,
+`kt_kv_prefill_lend.decode_lend`), and as many of the extra experts as fit go
+into slots on that memory; routes to them run on the GPU and leave the CPU's
+list. A window that opens, or an allocation that needs the pages, takes the
+slots out first and maps the pages back, so the pool keeps every token and a
+prefill starts with the memory it had without the lend. The placement must
+put the next-hottest experts at physical ids N..N+X-1 (the resident ones
+first). One launch an arm, the same placement on both sides:
+
+| Model (TP=2) | slots lent | decode without -> with |
+|---|---|---|
+| Qwen3.8-Flash-Next NVFP4 | X = 32 asked | 65.57 / 66.40 -> **67.97 / 67.69** |
+| DeepSeek V4.1-Flash MXFP4, 1M pool | 129 (3-4 a layer) | 28.95 -> **29.98** |
+| MiMo-V2.6-Flash MXFP4 | 174 (3-4 a layer) | 31.97 -> **32.80** |
+| DeepSeek V4-Flash-Vision MXFP4 | 100 (2-3 a layer) | 41.90 -> **42.57 / 43.54** |
+| Qwen3.5-35B-A3B bf16 (GPU-bound) | 640 (16 a layer) | 116.09 -> 114.60 |
+
+The 256-token paired NLL pieces stream and are token-identical; on the
+2-token pieces, which run the decode path, V4.1, MiMo and Vision are within
+launch noise, and Flash-Next moves by z +1.0 to +1.3 because a lent route
+leaves the CPU's W4A16 for the GPU's W4A4 (the slots match the resident GPU
+experts against a float32 reference). It pays where the CPU sets the token
+time; Qwen3.5, GPU-bound, loses the extra MoE call a layer, so leave it off
+there. A long prompt pays the take-back once (0.4-0.5 s in its allocation).
+`KT_KV_HOT_CHECK=<n>`
+compares the lent routes against the CPU computing them every n-th call.
+
+```
+python kv-vmm/sglang-kt-kv-vmm.py      <sglang tree>   # the plan's KV pool (copies kt_kv_hot_lend.py too)
+python kv-vmm/sglang-kt-kv-hot-lend.py <sglang tree>   # the wrapper's shadow layer and the slot routing
+```
+
+Knobs: `KT_KV_HOT_EXTRA` (the extra experts loaded a layer), `KT_KV_HOT_RESERVE`
+(4,096 tokens kept free), `KT_KV_HOT_MIN_MB` (256: the smallest lend worth a
+sync and a copy), `KT_KV_HOT_RETRY` (256 forwards between tries when nothing
+was lent), `KT_KV_HOT_MARGIN_MB` (64), `KT_KV_HOT_SPARE_FLOOR_MB` (the slots
+also take what the driver holds free in decode beyond this many MiB, and the
+plan counts it back at a window's start; off), `KT_KV_HOT_SLOTS_MAX` (a cap on
+slots a rank, for measurements that must hold the same slots in every lend).
+[deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)
+runs a later version on SGLang main, whose slots also follow the routing.
 
 ## How it is wired
 

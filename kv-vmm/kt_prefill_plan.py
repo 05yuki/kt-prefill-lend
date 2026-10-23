@@ -41,6 +41,24 @@ ALIGN = int(os.environ.get("KT_PREFILL_PLAN_ALIGN", "1024"))
 # of a launch without KT_PREFILL_PLAN_DELTA_MB); unset, the launch chunk
 SAFE = int(os.environ.get("KT_PREFILL_PLAN_SAFE", "0") or 0)
 STATS = {"plans": 0, "last": None}
+# what a request's own forward puts back on the GPU before its rows run, by name (bytes):
+# a model that keeps its vision tower on the host between images registers it
+# (sglang-dsv4-vision-on-demand.py), and a request with images is planned with that
+# much less room
+ON_DEMAND = {}
+
+
+def on_demand(name: str, nbytes: int) -> None:
+    ON_DEMAND[name] = int(nbytes)
+
+
+def _on_demand_for(req) -> int:
+    if not ON_DEMAND:
+        return 0
+    mm = getattr(req, "multimodal_inputs", None)
+    if mm is None or not getattr(mm, "mm_items", None):
+        return 0
+    return sum(ON_DEMAND.values())
 
 
 # room kept free in a planned window (MiB); unset: the lend's own margin. The
@@ -89,11 +107,15 @@ def needs_loan(fb) -> bool:
 
 
 def _remaining(req):
-    """(tokens to prefill, tokens already in the cache) for the request; lengths only:
-    prefix_indices is a tensor (its truth value is an error)."""
+    """(tokens to prefill, tokens already in the cache) for the request: SGLang main's
+    prefix_len, else a release's prefix_indices (a tensor: lengths only, its truth
+    value is an error)."""
     total = len(getattr(req, "origin_input_ids", None) or []) + len(getattr(req, "output_ids", None) or [])
-    pre = getattr(req, "prefix_indices", None)
-    done = 0 if pre is None else len(pre)
+    if hasattr(req, "prefix_len"):
+        done = int(req.prefix_len or 0)
+    else:
+        pre = getattr(req, "prefix_indices", None)
+        done = 0 if pre is None else len(pre)
     return max(0, total - done), done
 
 
@@ -103,7 +125,7 @@ def _free_now(scheduler) -> int:
         return FREE
     import torch
 
-    from sglang.srt.layers.moe import kt_lend
+    from sglang.srt.layers.moe import kt_kv_prefill_lend, kt_lend
 
     delta = kt_lend.STATE.get("pf_delta")
     if delta is None and DELTA:
@@ -112,11 +134,11 @@ def _free_now(scheduler) -> int:
     if kt_lend.STATE.get("phase") == "prefill":
         # a request taken while the window is still open (long prompts back to back,
         # no decode between): the device is already in the window's state, so decode
-        # free + step reads low by torch's cached blocks of the last chunk (V4.1-1017,
-        # 35K then 131K: 5,575 MiB planned against 7,390 at the window's start). What
-        # the next chunks have is the device's free memory now plus those blocks; not
-        # the window's start, which misses what the window has kept since (the
-        # stream's buffers grown to a larger chunk: 131K planned at 13,312 rows ran out)
+        # free + step reads low by torch's cached blocks of the last chunk (35K then
+        # 131K: 5,575 MiB planned against 7,390 at the window's start). What the next
+        # chunks have is the device's free memory now plus those blocks; not the
+        # window's start, which misses what the window has kept since (the stream's
+        # buffers grown to a larger chunk: 131K planned at 13,312 rows ran out)
         mine = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
     elif delta is not None:
         mine = torch.cuda.mem_get_info()[0] + delta
@@ -127,6 +149,12 @@ def _free_now(scheduler) -> int:
         # graph pool) is reused by the next chunks, and the fitted cost includes it
         # (kt_lend.end_window)
         mine += int(kt_lend.STATE.get("scratch_kept", 0) or 0)
+    if mine >= 0 and kt_lend.STATE.get("phase") != "prefill" and kt_kv_prefill_lend.HOT:
+        # the hot lend's share of the driver's free memory comes back at the window's
+        # start (kt_kv_hot_lend.py, in the DeepSeek-V4.1-1017 setup)
+        from sglang.srt.layers.moe import kt_kv_hot_lend
+
+        mine += int(kt_kv_hot_lend.STATE.get("spare_held", 0) or 0)
     t = torch.tensor([mine], dtype=torch.int64)
     group = getattr(scheduler, "tp_cpu_group", None)
     if group is not None and torch.distributed.is_initialized():
@@ -156,9 +184,14 @@ def chunk_for(scheduler, chunk: int) -> int:
         # (the same read-only match the scheduling policy makes; the adder
         # matches again when it takes the request)
         try:
-            from sglang.srt.managers.schedule_policy import match_prefix_for_req
+            try:
+                from sglang.srt.mem_cache.common import match_kv_cache
 
-            match_prefix_for_req(scheduler.tree_cache, req)
+                match_kv_cache(req, scheduler.tree_cache)
+            except ImportError:
+                from sglang.srt.managers.schedule_policy import match_prefix_for_req
+
+                match_prefix_for_req(scheduler.tree_cache, req)
         except Exception:
             pass
     rem, done = _remaining(req)
@@ -175,7 +208,8 @@ def chunk_for(scheduler, chunk: int) -> int:
     if free <= 0:
         return min(chunk, SAFE) if SAFE > 0 else chunk
     loan = kt_kv_prefill_lend.loan_estimate(scheduler, rem)
-    room = free + loan - _margin()
+    back = _on_demand_for(req)
+    room = free + loan - _margin() - back
     # the sliding-window pool's lent pages a request's chunks map back
     # (KT_PREFILL_SWA_LEND): nothing up to the mapped free ones, then a token's SWA
     # bytes a row, for every row the request may hold at once
@@ -186,11 +220,13 @@ def chunk_for(scheduler, chunk: int) -> int:
     def swa_cost(c: int) -> int:
         if swa is None:
             return 0
-        # one chunk holds its own rows; with more, the request may hold the SWA
-        # of every chunk until it ends (V4.1's chunk cache: SWA usage 0.31 ->
-        # 0.44 over three chunks, 0.76 GB mapped where two chunks' worth was
-        # planned), so the whole remaining prompt
-        need = c if rem <= c else rem
+        # one chunk holds its own rows; with more, the chunks held at once (swa[3]:
+        # two under the overlap scheduler, whose next chunk is allocated before the
+        # last one's slots are freed). Not the whole remaining prompt: a 512K prompt
+        # in 2,048-row chunks held 6% of a 77K-token pool throughout (2.25 chunks),
+        # 7,168-row chunks 19% (2.04), 18,432-row 46% (1.92) (10-18), while charging
+        # the remaining prompt planned 11.5 GB and kept a 512K prefill at 2,048 rows.
+        need = c if rem <= c else c * max(1, int(swa[3]))
         return 0 if need <= swa[0] else int((need - swa[0]) * swa[1] + swa[2])
 
     def fits(c: int, n: int) -> bool:
@@ -214,13 +250,15 @@ def chunk_for(scheduler, chunk: int) -> int:
     # the loan when the estimate needs it, and always past the lend's own chunk:
     # there the estimate is extrapolated, and lending costs a few tens of ms
     NEED[req.rid] = (FIXED + (CARRY if n > 1 else 0) + ROW * c + SEQ * (done + rem) + swa_cost(c)
-                     + _margin() > free) or (SAFE > 0 and c > SAFE)
+                     + _margin() + back > free) or (SAFE > 0 and c > SAFE)
     STATS["plans"] += 1
-    plan = (rem, n, c)
+    plan = (rem, n, c, back)
     if plan != STATS["last"]:
         STATS["last"] = plan
         print(f"[kt-prefill-plan] {rem} tokens to prefill after {done} cached: {n} chunk(s) of {c} "
               f"(free {free >> 20} MiB + loan {loan >> 20} MiB, fixed {FIXED >> 20} MiB, "
               f"{ROW / 1024:.0f} KiB a row, {SEQ:.0f} B a sequence token, carry {CARRY >> 20} MiB, "
-              f"SWA mapped back {swa_cost(c) >> 20} MiB, cap {chunk})", flush=True)
+              f"SWA mapped back {swa_cost(c) >> 20} MiB"
+              + (f", {back >> 20} MiB back on the GPU for the images ({', '.join(ON_DEMAND)})" if back else "")
+              + f", cap {chunk})", flush=True)
     return c

@@ -117,7 +117,9 @@ then `patches/kt-kernel-lend-gpu-output.py`, on `kt_kernel/experts_base.py`),
 and source `tools/kt-lend-auto.sh` in your launcher to have the chunk picked
 for you. For the plan: `kv-vmm/build.sh`, then
 `python kv-vmm/sglang-kt-kv-vmm.py <sglang tree>` and the row-block patch for
-your streamer. Every step in full: [docs/details.md](docs/details.md#applying-it).
+your streamer; for the hot lend, `python kv-vmm/sglang-kt-kv-hot-lend.py <sglang tree>`
+and `KT_KV_HOT_LEND=1 KT_KV_HOT_EXTRA=<X>`. Every step in full:
+[docs/details.md](docs/details.md#applying-it).
 
 Then send a long prompt and watch `nvidia-smi`: usage climbs for the prefill
 and drops back for decode. `KT_PREFILL_LEND=0` turns it off.
@@ -135,6 +137,23 @@ Strata's IQ3_S GGUF, one MTP draft step, decode:
 | one card + one socket | 56 | 81.5-82.0 | 65,536 |
 | one card + one socket + the KV lend | 56 + 14-18 lent | **83.8-84.6** | 65,536 |
 
+## Hot experts in the KV pool's free pages (NVFP4, MXFP4)
+
+`kv-vmm/kt_kv_hot_lend.py` does the same for the GPU's own expert method:
+outside prefill the plan's free KV pages hold more hot experts, and a prefill
+or a request that needs the pages takes them back first. Decode, TP=2:
+
+| Model | slots lent | decode without -> with |
+|---|---|---|
+| Qwen3.8-Flash-Next NVFP4 | X = 32 asked | 65.57 / 66.40 -> **67.97 / 67.69** |
+| DeepSeek V4.1-Flash MXFP4, 1M pool | 3-4 a layer | 28.95 -> **29.98** |
+| MiMo-V2.6-Flash MXFP4 | 3-4 a layer | 31.97 -> **32.80** |
+| DeepSeek V4-Flash-Vision MXFP4 | 2-3 a layer | 41.90 -> **42.57 / 43.54** |
+
+It pays where the CPU experts set the token time; a GPU-bound model (Qwen3.5
+bf16) loses a little. Setup and the NLL notes:
+[docs/details.md](docs/details.md#hot-experts-and-the-kv-pools-free-pages).
+
 ## Requirements and limits
 
 - Who it is for: people running a KTransformers hybrid who are comfortable
@@ -146,11 +165,19 @@ Strata's IQ3_S GGUF, one MTP draft step, decode:
   card and one socket. Not tested: EP, DP attention, PP.
 - `expandable_segments` is refused by torch_memory_saver.
 - A model that reads another layer's weights during prefill faults instead of
-  reading stale data; `KT_PREFILL_LEND_SKIP` keeps such weights resident.
+  reading stale data; `KT_PREFILL_LEND_SKIP` / `KT_PREFILL_LEND_RESIDENT` keep
+  such weights resident.
+- Measured one request at a time; concurrent serving is not measured beyond
+  the window transitions waiting for in-flight GPU work.
 
 The rest, and every knob: [docs/details.md](docs/details.md).
 
 ## Related work
+
+[deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)
+runs all of this on SGLang main for DeepSeek V4.1-Flash-1017: the lend, the
+plan, a hot lend whose slots follow the routing, and the KV pool past the GPU
+in host memory (kv-vmm's split ranges), so one 16 GB card serves a 1M context.
 
 [Strata](https://github.com/Niko1221/Strata) lends slots of its GPU expert
 cache to the prompt path and refills them afterwards, inside its own engine.
