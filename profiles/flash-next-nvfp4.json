@@ -9,15 +9,12 @@
   },
   "defaults": {
     "2": {
-      "context": 262144,
-      "mem_fraction": 0.85,
       "kv_dtype": "bf16",
       "mamba_slots": 32,
       "pools": 2,
-      "hot": 32,
       "chunk": 16384,
       "threads": 60,
-      "note": "captured 10-13 from the in-house launcher; with hot 32 and the draft at 0.85 the pool is 37,248 (VRAM-bound), 49-50 tok/s on 1024-token warmups; hot 10 keeps the full 262,144 pool at 43 tok/s"
+      "free_min_gb": 1.0
     }
   },
   "command": [
@@ -161,5 +158,6 @@
       "pool_tokens": 37248,
       "avail_after_pool_gb": 2.41
     }
-  }
+  },
+  "min_hot": 1
 }

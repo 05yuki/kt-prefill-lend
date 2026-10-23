@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """host (hostprobe) + model (modelprobe) + intent -> the launch knobs, with the arithmetic shown.
 
-usage: plan-launch.py <model dir> [--gguf DIR] [--tp N] [--context TOKENS] [--kv-dtype bf16|fp8] [--mamba-slots N]
-                      [--mem-fraction F] [--embed-host 0|1] [--draft-bytes B] [--host-json FILE] [--model-json FILE]
-                      [--env]
-Per rank, the VRAM budget is  vram_total * mem_fraction  minus the CUDA context; from it come, in this order:
-  dense weights (sharded by TP; the hyper-connection mixes and norms are replicated), lm_head (sharded), the token
-  table (0 if it lives in pinned host memory), the MTP draft, the KV pool for --context tokens (never reduced: the
-  pool is the context), the linear-attention states for --mamba-slots sequences, the CUDA graphs and the attention
-  workspace, and what is left is hot expert slots (the slot is the model's mean expert size). Threads for the CPU
+usage: plan-launch.py <model dir> [--gguf DIR] [--tp N] [--context TOKENS] [--max-context TOKENS] [--min-hot N]
+                      [--free-min-gb G] [--kv-dtype bf16|fp8] [--mamba-slots N] [--embed-host 0|1] [--draft-bytes B]
+                      [--host-json FILE] [--model-json FILE] [--env]
+The context is the model's (max_position_embeddings, or --max-context where the profile serves another) unless
+--context is given, and the KV pool is the context: it is never made smaller to make room for anything else.
+Per rank, the VRAM card is split as
+  card = static + CUDA graphs + free memory decode keeps (--free-min-gb)
+  static = what the server holds besides its weights when it sizes the pool (CUDA context, NCCL; "overhead" when
+           calibrated) + dense weights (sharded by TP; the hyper-connection mixes and norms replicated) + lm_head
+           (sharded) + the token table (0 if it lives in pinned host memory) + the MTP draft + the KV pool for the
+           context + the linear-attention states for --mamba-slots sequences + hot expert slots
+and what static leaves after everything but the slots is hot expert slots (the slot is the model's mean expert
+size). SGLang's --mem-fraction-static is not a knob: it is static / card, printed for the command line. When not
+even --min-hot slots a layer fit beside the model's context, the context is the largest that leaves them, and
+the plan says so. Threads for the CPU
   expert pools are each node's physical cores minus two; the prefill chunk is what the free VRAM after the pool
   allows for the streamed prefill (~365 KB a token with the chunk-sized scratch, measured 10-13). The constants
   (CUDA context, graphs, workspace, per-token scratch) are the measured ones of the Flash-Next GGUF stack and are
@@ -25,7 +32,6 @@ GiB = 2**30
 # measured on the 5070 Ti / Flash-Next GGUF launches (native-ubuntu/GGUF-EXPERTS-20261007.md, 10-13 logs)
 CUDA_CONTEXT = 0.50 * GiB      # driver + context per process
 GRAPHS = 0.35 * GiB            # target verify + draft extend graphs
-WORKSPACE = 1.00 * GiB         # attention / sampling workspace kept after the pool is sized (decode-vram frees ~0.9)
 PREFILL_SCRATCH_PER_TOKEN = 365 * 1024   # streamed prefill: scratch per chunk token
 CHUNK_MAX = 16384
 
@@ -73,17 +79,31 @@ def plan(host, model, a):
         kv_tok = cal["kv_bytes_per_token"] * kv_scale
         kv = a.context * kv_tok
         lin = cal["states_bytes"] / max(1, cal.get("states_slots") or 1) * a.mamba_slots
-        budget = vram * a.mem_fraction
+        graphs = cal.get("graphs") or GRAPHS
+        budget = vram - graphs - a.free_min_gb * GiB
         fixed = cal["weights_fixed"] + kv + lin + cal["overhead"] + (0 if cal.get("includes_draft") else draft)
         notes.append(f"constants from {os.path.basename(os.path.dirname(cal['from']['log']))}: fixed weights "
                      f"{cal['weights_fixed'] / GiB:.2f} GiB, {kv_tok / 1024:.2f} KiB a token, overhead {cal['overhead'] / GiB:.2f} GiB")
     else:
-        budget = vram * a.mem_fraction - CUDA_CONTEXT
-        fixed = dense + lm_head + embed + draft + kv + lin + GRAPHS + WORKSPACE
-    left = budget - fixed
+        graphs = GRAPHS
+        budget = vram - graphs - a.free_min_gb * GiB
+        fixed = CUDA_CONTEXT + dense + lm_head + embed + draft + kv + lin
     e = model.get("experts")
-    hot = 0
     slot = e["bytes_per_expert_mean"] / tp if e else 0  # the experts are tensor-parallel too: a rank holds 1/tp of a slot
+    layer_slots = slot * (e["moe_layers"] if e else 0)
+    if a.context_auto and kv_tok > 0:
+        # the model's context does not leave --min-hot slots a layer: the largest context that does, whole pages
+        room = budget - (fixed - kv) - a.min_hot * layer_slots - (kv - a.context * kv_tok)
+        fit = int(room // kv_tok) // 4096 * 4096
+        if fit < a.context:
+            notes.append(f"the model's context {a.context} needs {(a.context * kv_tok) / GiB:.2f} GiB of KV a rank; with "
+                         f"{a.min_hot} hot experts a layer {max(0, fit)} fits on this card (more cards, fp8 KV, or a "
+                         f"smaller --context)")
+            fixed -= (a.context - max(0, fit)) * kv_tok
+            kv -= (a.context - max(0, fit)) * kv_tok
+            a.context = max(0, fit)
+    left = budget - fixed
+    hot = 0
     if e and left > 0:
         hot = int(left // slot // e["moe_layers"])
     # KT_HOT_KV_LEND: the empty pool's pages carry slots as well (~90% of the pool), given back as the KV grows;
@@ -119,25 +139,28 @@ def plan(host, model, a):
     if busy:
         notes.append("GPUs in use: " + ", ".join(f"{u['name']}({u['pid']})" for u in busy))
     return {"tp": tp, "gpus": [g["uuid"] for g in ranks], "gpu_nodes": [g["numa_node"] for g in ranks],
-            "vram_per_rank": vram, "mem_fraction": a.mem_fraction, "budget": budget,
+            "vram_per_rank": vram, "mem_fraction": int(budget / vram * 1000) / 1000, "budget": budget,
+            "graphs": graphs, "free_min": a.free_min_gb * GiB,
             "terms": ({"weights_fixed": cal["weights_fixed"], "draft": 0 if cal.get("includes_draft") else draft, "kv_pool": kv, "linear_states": lin, "overhead": cal["overhead"]} if cal else
                       {"dense+hc": dense, "lm_head": lm_head, "token_table": embed, "draft": draft, "kv_pool": kv,
-                       "linear_states": lin, "graphs": GRAPHS, "workspace": WORKSPACE, "cuda_context": CUDA_CONTEXT}),
+                       "linear_states": lin, "cuda_context": CUDA_CONTEXT}),
             "pool_predicted_tokens": int((budget - fixed + kv - hot * slot * (e["moe_layers"] if e else 0)) / max(1, kv / max(1, a.context))) if cal else None,
             "left_for_hot": left, "hot_experts_per_layer": hot, "lent_from_empty_pool": lent, "moe_layers": e["moe_layers"] if e else 0,
             "hot_fixed_with_kv_lend": max(0, hot - lent), "expert_slot_per_rank": slot,
-            "context": a.context, "kv_dtype": a.kv_dtype, "mamba_slots": a.mamba_slots, "chunk": chunk,
+            "context": a.context, "model_context": a.model_context, "kv_bytes_per_token": kv_tok, "kv_dtype": a.kv_dtype, "mamba_slots": a.mamba_slots, "chunk": chunk,
             "cpu_pools": pools, "threads": threads, "ram_need_experts_ple": ram_need, "notes": notes}
 
 
 def table(p):
     g = lambda x: f"{x / GiB:6.2f} GiB"
-    lines = [f"tp {p['tp']} on nodes {p['gpu_nodes']}: VRAM {g(p['vram_per_rank'])} x {p['mem_fraction']} - context = budget {g(p['budget'])} per rank"]
+    lines = [f"tp {p['tp']} on nodes {p['gpu_nodes']}: VRAM {g(p['vram_per_rank'])} - graphs {g(p['graphs'])} - free kept {g(p['free_min'])} "
+             f"= static {g(p['budget'])} per rank (--mem-fraction-static {p['mem_fraction']})"]
     for k, v in p["terms"].items():
         lines.append(f"  {k:14s} {g(v)}")
     lines.append(f"  left for hot  {g(p['left_for_hot'])} -> {p['hot_experts_per_layer']} hot experts per layer (slot {p['expert_slot_per_rank'] / 2**20:.2f} MiB per rank); "
                  f"with KT_HOT_KV_LEND the empty pool lends ~{p['lent_from_empty_pool']} more, so KT_GPU_EXPERTS={p['hot_fixed_with_kv_lend']} then")
-    lines.append(f"context {p['context']} ({p['kv_dtype']} KV, pool = context), mamba slots {p['mamba_slots']}, prefill chunk {p['chunk']}"
+    lines.append(f"context {p['context']}" + (f" of the model's {p['model_context']}" if p['context'] != p['model_context'] else "")
+                 + f" ({p['kv_dtype']} KV, pool = context), mamba slots {p['mamba_slots']}, prefill chunk {p['chunk']}"
                  + (f"; pool predicted at this hot: {p['pool_predicted_tokens']} tokens" if p.get("pool_predicted_tokens") else ""))
     lines.append("cpu pools: " + ", ".join(f"node {q['node']} x {q['threads']} threads (free {q['ram_free'] / GiB:.0f} GiB, page cache {q['page_cache'] / GiB:.0f})" for q in p["cpu_pools"])
                  + f"; experts + PLE in RAM {g(p['ram_need_experts_ple'])}")
@@ -160,10 +183,12 @@ def main():
     ap.add_argument("--gguf")
     ap.add_argument("--experts-from")
     ap.add_argument("--tp", type=int, default=2)
-    ap.add_argument("--context", type=int, default=65536)
+    ap.add_argument("--context", type=int, help="tokens (default: the model's context, see --max-context)")
+    ap.add_argument("--max-context", type=int, help="the context the profile serves when it is not max_position_embeddings")
+    ap.add_argument("--min-hot", type=int, default=0, help="hot experts a layer the model needs (Flash-Next: 1)")
+    ap.add_argument("--free-min-gb", type=float, default=1.0, help="free memory decode keeps beside the graphs, GiB")
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8"], default="bf16")
     ap.add_argument("--mamba-slots", type=int, default=8)
-    ap.add_argument("--mem-fraction", type=float, default=0.93)
     ap.add_argument("--embed-host", type=int, default=1)
     ap.add_argument("--draft-bytes", type=float)
     ap.add_argument("--host-json")
@@ -180,6 +205,10 @@ def main():
     mcmd = [sys.executable, os.path.join(HERE, "modelprobe.py"), a.model_dir, "--json"] + (["--gguf", a.gguf] if a.gguf else []) \
         + (["--experts-from", a.experts_from] if a.experts_from else [])
     model = load(mcmd, a.model_json)
+    a.model_context = a.max_context or int(model["config"].get("max_position_embeddings") or 0) or 65536
+    a.context_auto = a.context is None
+    if a.context is None:
+        a.context = a.model_context
     p = plan(host, model, a)
     if a.env:
         print(env_line(p))

@@ -108,22 +108,18 @@ def main():
             v = sub_paths(v)
         penv[k] = v
     tp = defaults.get("tp", "1")
-    # "context" is the pool the plan sizes the KV for (--max-total-tokens when given, else --context-length);
-    # a larger --context-length is kept apart as context_length (DeepSeek V4: 1M context over a 262K pool)
-    ctx_len = int(defaults.get("context_length", 0) or 0)
-    pool = int(defaults.get("context", 0) or 0) or ctx_len
-    if not defaults.get("context"):
-        command = ["{context}" if c == "{context_length}" else c for c in command]
-    d = {"context": pool, "mem_fraction": float(defaults.get("mem_fraction", 0)),
-         "kv_dtype": "fp8" if defaults.get("kv_cache_dtype", "").startswith("fp8") else "bf16",
+    # the KV pool is the context: --max-total-tokens holds it there
+    if "--max-total-tokens" not in command:
+        command += ["--max-total-tokens", "{context}"]
+    # the context, the hot count and the memory fraction are not kept: serve.py plans them from the model and the
+    # card (the context is the model's, the pool is the context, the hot experts take what is left)
+    d = {"kv_dtype": "fp8" if defaults.get("kv_cache_dtype", "").startswith("fp8") else "bf16",
          "mamba_slots": int(defaults.get("mamba_slots", 8) or 8), "pools": int(defaults.get("pools", 1) or 1),
-         "hot": int(defaults.get("hot", 0) or 0), "chunk": int(defaults.get("chunk", 0) or 0),
-         "threads": int(threads) if threads else None,
-         **({"context_length": ctx_len} if ctx_len and ctx_len != pool else {}),
-         "note": f"taken from a running launch on {os.uname().nodename} by profile-from-launch.py"}
+         "chunk": int(defaults.get("chunk", 0) or 0), "threads": int(threads) if threads else None,
+         "free_min_gb": 1.0}
     prof = {"name": a.name, "description": f"captured from a launch ({'pid ' + str(a.pid) if a.pid else a.command})",
             "weights": json.loads(a.weights), "defaults": {tp: d}, "command": command,
-            "env": dict(sorted(penv.items())), "env_by_tp": {tp: {}}}
+            "env": dict(sorted(penv.items())), "env_by_tp": {tp: {}}, "min_hot": 0}
     if draft_cmd:
         prof["command_with_draft"] = draft_cmd
         for k in ("KT_NEXT_MTP_PAD_FP8", "KT_NEXT_MTP_GPU_ONLY", "KT_MTP_Q2_0", "KT_MTP_GGUF"):

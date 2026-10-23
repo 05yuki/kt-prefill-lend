@@ -4,8 +4,8 @@
   "tree": "sglang-v0.5.19 + trees/flash-next-gguf",
   "weights": {"gguf": true, "experts_from": false, "embed_host": 1, "draft": "dir", "draft_bytes_assumed": 0.84},
   "defaults": {
-    "1": {"context": 65536, "mem_fraction": 0.93, "kv_dtype": "bf16", "mamba_slots": 8, "pools": 1},
-    "2": {"context": 131072, "mem_fraction": 0.955, "kv_dtype": "bf16", "mamba_slots": 8, "pools": 2}
+    "1": {"kv_dtype": "bf16", "mamba_slots": 8, "pools": 1, "free_min_gb": 1.0},
+    "2": {"kv_dtype": "bf16", "mamba_slots": 8, "pools": 2, "free_min_gb": 0.85}
   },
   "command": [
     "-m", "sglang.launch_server",
@@ -51,5 +51,6 @@
   },
   "env_with_draft": {"KT_MTP_GGUF": "{draft_gguf}", "KT_NEXT_MTP_GPU_ONLY": "1", "KT_MTP_Q2_0": "1"},
   "env_with_draft_hot": {"KT_DRAFT_HOT": "{draft_hot}"},
-  "env_with_hot_seed": {"KT_HOT_SEED": "{hot_seed}"}
+  "env_with_hot_seed": {"KT_HOT_SEED": "{hot_seed}"},
+  "min_hot": 1
 }

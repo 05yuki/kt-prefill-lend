@@ -9,16 +9,12 @@
   },
   "defaults": {
     "2": {
-      "context": 262144,
-      "mem_fraction": 0.985,
       "kv_dtype": "fp8",
       "mamba_slots": 8,
       "pools": 2,
-      "hot": 10,
       "chunk": 16384,
       "threads": 64,
-      "context_length": 1048576,
-      "note": "taken from a running launch on samuel-H12D-16D by profile-from-launch.py"
+      "free_min_gb": 1.0
     }
   },
   "command": [
@@ -156,5 +152,7 @@
       "pool_tokens": 262144,
       "avail_after_pool_gb": 2.35
     }
-  }
+  },
+  "min_hot": 0,
+  "max_context": 1048576
 }

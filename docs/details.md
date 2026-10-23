@@ -22,24 +22,49 @@ tools/serve.py --profile <name> --venv <venv> --tree <patched sglang tree> --con
 It probes the host (`hostprobe.py`: GPUs by NUMA node, cores and RAM per
 node, THP / swap / `min_free_kbytes`), reads the model (`modelprobe.py`:
 experts and their slot size, dense bytes, the KV family and its bytes per
-token, all from the weight headers), sizes the launch (`plan-launch.py`: the
-per-rank VRAM budget spent in order — dense, lm_head, draft, the KV pool for
-the context, linear-attention states, graphs, workspace — and the hot experts
-per layer that remain, minus what the empty pool lends), binds each rank to
-its socket, and prints the command with the arithmetic. `--dry-run` prints
-without starting; `--hot` / `--chunk` / `--mem-fraction` override the plan.
+token, all from the weight headers), sizes the launch (`plan-launch.py`),
+binds each rank to its socket, and prints the command with the arithmetic.
+`--dry-run` prints without starting; `--hot` / `--chunk` override the plan.
+
+**The context is the model's.** Without `--context` the serve takes the
+model's own context (`max_position_embeddings`, or the profile's
+`max_context`), and the KV pool is the context: `--max-total-tokens` holds it
+there, and nothing else is ever paid for out of it. Each card is split as
+
+    card = static + CUDA graphs + the free memory decode keeps (the profile's free_min_gb)
+    static = what the server holds beside its weights when it sizes the pool (CUDA context, NCCL)
+           + dense weights + lm_head + token table + draft + KV pool + linear-attention states + hot experts
+
+and the hot experts per layer are what static leaves. There is no memory
+fraction to choose: `--mem-fraction-static` is static / card, printed with
+the plan. When the model's context does not leave the profile's `min_hot`
+experts a layer (Flash-Next needs 1), the context is the largest that does,
+and the plan says so before the launch.
+
+**`--calibrate`** launches, reads the server's own accounting from its log
+(`plan-calibrate.py`: weights and the draft's on the rank that holds most,
+the KV bytes a token summed over every pool a rank makes, states, graphs, and
+what the card had free once the pools were made, which gives the overhead
+exactly), keeps those constants for this profile, TP and expert set under
+`--cache-dir`, plans again from them, and launches again when the context or
+the hot count moved. Later launches plan from the measured constants at once.
+
+The first long prompt after an install compiles flashinfer's CUTLASS MoE
+kernel for the streamed prefill (about 7 minutes on the host here, once per
+venv).
 
 Profiles in the repo, each verified by the same prompt-NLL check (three fixed
 texts scored teacher-forced on the in-house launcher and on `serve.py`,
-identical to four decimals):
+identical to four decimals). The context column is what `--calibrate` settled
+on 16 GB cards; the last three profiles have not been through it yet:
 
-| profile | model | TP | KV | pool |
+| profile | model | TP | KV | context |
 |---|---|---|---|---|
-| `flash-next-gguf` | Qwen3.8-Flash-Next from Strata's IQ3_S GGUF, MTP draft | 1 / 2 | bf16 | 65,536 / 121,152 |
+| `flash-next-gguf` | Qwen3.8-Flash-Next from Strata's IQ3_S GGUF, MTP draft | 1 / 2 | bf16 | 245,760 / 262,144 |
 | `flash-next-nvfp4` | Qwen3.8-Flash-Next NVFP4 (ModelOpt) | 2 | bf16 | 262,144 |
-| `glm53-flash` | GLM-5.3-Flash, NVFP4 experts, full-GPU prefill | 2 | bf16 | 131,072 |
-| `dsv4-flash-vision` | DeepSeek V4-Flash-Vision MXFP4, 1M context | 2 | fp8 | 262,144 |
-| `mimo-v26-flash` | MiMo-V2.6-Flash MXFP4 | 2 | fp8 | 262,144 |
+| `glm53-flash` | GLM-5.3-Flash, NVFP4 experts, full-GPU prefill | 2 | bf16 | |
+| `dsv4-flash-vision` | DeepSeek V4-Flash-Vision MXFP4, 1M context | 2 | fp8 | |
+| `mimo-v26-flash` | MiMo-V2.6-Flash MXFP4 | 2 | fp8 | |
 
 **A new model** takes one launch of whatever launcher already runs it:
 
@@ -47,16 +72,16 @@ identical to four decimals):
 tools/profile-from-launch.py --pid <launch_server pid> --name <name> --out profiles/<name>.json \
                              --config-dir <model dir> [--experts DIR] [--draft-dir DIR] --cache-dir <dir>
 tools/plan-calibrate.py <that launch's server.log> --hot N --slot-bytes B --moe-layers L \
-                        --vram-total BYTES --mem-fraction F [--kv-dtype fp8] --write profiles/<name>.json
+                        --vram-total BYTES --mem-fraction F --tp N [--kv-dtype fp8] --write profiles/<name>.json
 ```
 
 The first reads the running process's environment and command line and turns
 the paths and sized values into placeholders (nothing is transcribed from a
 script). The second reads the log's accounting lines (weights, KV pool,
 states, graphs; DeepSeek V4's hybrid pool lines included) and writes the
-constants the plan then uses: with them, the plan predicts the pool and the
-hot count of a launch at another memory fraction or context without a second
-launch. Without a profile, `plan-launch.py` still sizes a launch from the
+constants the plan then uses for that TP: with them, the plan predicts the
+pool and the hot count of a launch at another context without a second
+launch (`serve.py --calibrate` does the same on your host). Without a profile, `plan-launch.py` still sizes a launch from the
 headers alone; its constants are then the ones measured on our cards and are
 printed with every plan.
 
@@ -64,6 +89,20 @@ What stays model-specific: a hot-expert placement file (`--placement`, a JSON
 of the hottest experts per layer from an earlier run). Without one the serve
 runs the loader's trivial placement, which is valid but a different set of
 GPU experts, so its NLL differs from a placed launch's.
+
+The hot count moves the output as well. GPU experts run on the GPU's kernel
+(W4A4 on the tensor cores for NVFP4) and CPU experts on kt-kernel's (W4A16),
+and the two partial sums are added at the end, so which experts sit on the
+GPU changes the result. The streamed prefill (prompts above
+`KT_GPU_STREAM_PREFILL` tokens) groups the remaining experts from the hot
+count up and rounds each group's sum to bf16, so long prompts move with it
+too. A launch is deterministic: the same hot count gives the same logprobs
+bit for bit, launch after launch, whatever the random seed. On Flash-Next
+NVFP4 one more hot expert a layer (49 -> 50) moved the per-token log-prob by a
+median 0.14 and the mean NLL of 24 pieces of 256 tokens by 0.01, on the
+streamed path as on the short one. `--calibrate` picks the hot count from the
+card, so two hosts' NLLs differ by about that much: compare NLL at a fixed
+`--hot`.
 
 ## Results: notes
 
@@ -316,7 +355,8 @@ library into `layers/moe/`, the `kv_cache` region, the scheduler's chunk and
 prompt-length hooks, and where the tree has them the KV cache configurator's
 SWA hunks and the chunk-cache SWA eviction), the row-block patch for its
 streamer, and on GLM-5.3's tree `patches/sglang-kt-staging-plan.py`. Then
-`tools/serve.py ... --plan`, or in a launcher, after `kt_lend_auto`:
+`tools/serve.py` (the plan is on when the tree has the library; `tools/install.sh`
+does all of this), or in a launcher, after `kt_lend_auto`:
 
 ```bash
 kt_prefill_plan_setup        # "swa" as its argument for a hybrid SWA model
@@ -562,7 +602,8 @@ first). One launch an arm, the same placement on both sides:
 | DeepSeek V4-Flash-Vision MXFP4 | 100 (2-3 a layer) | 41.90 -> **42.57 / 43.54** |
 | Qwen3.5-35B-A3B bf16 (GPU-bound) | 640 (16 a layer) | 116.09 -> 114.60 |
 
-The 256-token paired NLL pieces stream and are token-identical; on the
+The 256-token paired NLL pieces are token-identical (a prefill takes the
+slots back before it runs); on the
 2-token pieces, which run the decode path, V4.1, MiMo and Vision are within
 launch noise, and Flash-Next moves by z +1.0 to +1.3 because a lent route
 leaves the CPU's W4A16 for the GPU's W4A4 (the slots match the resident GPU

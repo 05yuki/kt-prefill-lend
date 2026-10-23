@@ -23,34 +23,55 @@ import sys
 GiB = 2**30
 
 
+def graphs_per_rank(s):
+    """The CUDA graphs' memory of the rank that took most (a rank's captures summed; lines tagged TPn)."""
+    per = {}
+    for line in s.splitlines():
+        m = re.search(r"Capture [^\n]*end\.[^\n]*mem usage=([0-9.]+) GB", line)
+        if m:
+            r = re.search(r"\bTP(\d+)\]", line)
+            k = r.group(1) if r else "0"
+            per[k] = per.get(k, 0.0) + float(m.group(1))
+    return max(per.values()) if per else None
+
+
 def parse(log):
     s = open(log, "rb").read().decode("utf-8", "replace")
     g = lambda pat, cast=float: (cast(re.search(pat, s).group(1)) if re.search(pat, s) else None)
+    # every rank prints its own lines, and a draft model its own after the target's: the target's weights and the
+    # draft's (MTP / NextN) on the rank that holds most, and the least any rank had free once every pool was made
+    loads = re.findall(r"Load weight end\.[^\n]*?type=(\w+)[^\n]*mem usage=([0-9.]+) GB", s)
+    target = [float(m) for t, m in loads if not t.endswith(("MTP", "NextN"))]
+    draft = [float(m) for t, m in loads if t.endswith(("MTP", "NextN"))]
+    pool_end = [float(x) for x in re.findall(r"Memory pool end\. avail mem=([0-9.]+) GB", s)]
     out = {
-        "weights_gb": g(r"Load weight end\.[^\n]*mem usage=([0-9.]+) GB"),
+        "weights_gb": (max(target) + (max(draft) if draft else 0)) if target else g(r"Load weight end\.[^\n]*mem usage=([0-9.]+) GB"),
         "pool_tokens": g(r"KV Cache is allocated\. #tokens: (\d+)", int),
         "kv_gb": g(r"KV Cache is allocated\. #tokens: \d+, KV size: ([0-9.]+) GB"),
         "ssm_gb": g(r"ssm_state size: ([0-9.]+)GB"),
         "conv_gb": g(r"conv_state size: ([0-9.]+)GB"),
         "mamba_slots": g(r"mamba_cache_size: (\d+)", int),
-        "avail_after_pool_gb": g(r"Memory pool end\. avail mem=([0-9.]+) GB"),
-        "graphs_gb": sum(float(x) for x in re.findall(r"Capture [^\n]*end\.[^\n]*mem usage=([0-9.]+) GB", s)) or None,
+        "avail_after_pool_gb": min(pool_end) if pool_end else None,
+        "graphs_gb": graphs_per_rank(s),
         "max_total_num_tokens": g(r"max_total_num_tokens=(\d+)", int),
-        "had_draft": "speculative_draft_model_path': '/" in s or "speculative_draft_model_path\": \"/" in s,
+        "had_draft": bool(draft) or "speculative_draft_model_path': '/" in s or "speculative_draft_model_path\": \"/" in s,
     }
     # Flash-Next logs: K size / V size lines (one per pool: the target's full-attention pool first, the draft's
     # after; every rank prints its own, so take the lines of one rank: up to the first repeat of the pool size)
     if out["kv_gb"] is None:
-        ks = re.findall(r"KV Cache is allocated\.[^\n]*#tokens: (\d+), K size: ([0-9.]+) GB, V size: ([0-9.]+) GB", s)
-        if ks:
-            out["pool_tokens"] = int(ks[0][0])
-            seen, total = set(), 0.0
-            for n, k, v in ks:
-                if (n, k, v) in seen:
-                    break
-                seen.add((n, k, v))
-                total += float(k) + float(v)
-            out["kv_gb"] = total
+        # every pool a rank makes (the target's, a draft's) prints one line, tagged TPn: summed per rank, the
+        # largest rank kept (lines of the ranks interleave, so the order says nothing)
+        per, pool = {}, None
+        for line in s.splitlines():
+            m = re.search(r"KV Cache is allocated\.[^\n]*#tokens: (\d+), K size: ([0-9.]+) GB, V size: ([0-9.]+) GB", line)
+            if m:
+                r = re.search(r"\bTP(\d+)\]", line)
+                k = r.group(1) if r else "0"
+                per[k] = per.get(k, 0.0) + float(m.group(2)) + float(m.group(3))
+                pool = int(m.group(1)) if pool is None else pool
+        if per:
+            out["pool_tokens"] = pool
+            out["kv_gb"] = max(per.values())
     # DeepSeek V4 logs: the hybrid pools are sized from one "bytes per full token" figure
     # ("DSV4 memory calculation: bytes_per_full_token=B ... full_token=N" then "DSV4 pool sizes: full=N, swa=..."):
     # the last pool-sizes line is the pool the serve kept (the first is the uncapped capacity)
@@ -75,6 +96,7 @@ def main():
     ap.add_argument("--vram-total", type=float, required=True, help="bytes of one card")
     ap.add_argument("--mem-fraction", type=float, required=True)
     ap.add_argument("--kv-dtype", default="bf16")
+    ap.add_argument("--tp", type=int, required=True, help="the launch's TP: the constants are per rank, for that TP only")
     ap.add_argument("--context", type=int, help="the launch's context; when the pool equals it, the overhead is only an upper bound")
     ap.add_argument("--write")
     a = ap.parse_args()
@@ -86,20 +108,31 @@ def main():
     weights = p["weights_gb"] * GiB
     states = ((p["ssm_gb"] or 0) + (p["conv_gb"] or 0)) * GiB
     pool_bytes = p["kv_gb"] * GiB
-    budget = a.vram_total * a.mem_fraction
-    overhead = budget - weights - states - pool_bytes
     capped = a.context is not None and p["pool_tokens"] >= a.context
+    if not capped or p["avail_after_pool_gb"] is None:
+        # SGLang sized the pool itself: static less everything else is what it kept beside them, its own
+        # reservations included (exact when the pool was not capped by the context)
+        overhead = a.vram_total * a.mem_fraction - weights - states - pool_bytes
+    else:
+        # a capped pool says only what the card had free once it was made: a lower bound on what SGLang keeps
+        # (0.5 GiB short on Flash-Next GGUF TP2); the next launch's shortfall, if any, corrects it
+        overhead = a.vram_total - p["avail_after_pool_gb"] * GiB - weights - states - pool_bytes
     c = {"weights_fixed": weights - hot_bytes, "kv_bytes_per_token": pool_bytes / p["pool_tokens"], "kv_dtype": a.kv_dtype,
          "states_bytes": states, "states_slots": p["mamba_slots"], "overhead": overhead, "graphs": (p["graphs_gb"] or 0) * GiB,
          "overhead_is_upper_bound": capped, "includes_draft": bool(p["had_draft"]),
          **({"dsv4_pools": p["dsv4_pools"]} if p.get("dsv4_pools") else {}),
-         "from": {"log": a.log, "hot": a.hot, "mem_fraction": a.mem_fraction, "pool_tokens": p["pool_tokens"],
+         "from": {"log": a.log, "tp": a.tp, "hot": a.hot, "mem_fraction": a.mem_fraction, "pool_tokens": p["pool_tokens"],
                   "avail_after_pool_gb": p["avail_after_pool_gb"]}}
     print(f"weights {p['weights_gb']:.2f} GB of which hot {hot_bytes / GiB:.2f} GiB -> fixed {c['weights_fixed'] / GiB:.2f} GiB; "
           f"pool {p['pool_tokens']} tokens = {p['kv_gb']:.2f} GB -> {c['kv_bytes_per_token'] / 1024:.2f} KiB a token ({a.kv_dtype}); "
           f"states {states / GiB:.2f} GiB ({p['mamba_slots']} slots); overhead {overhead / GiB:.2f} GiB{' (upper bound: the pool was capped by the context)' if capped else ''}; graphs {c['graphs'] / GiB:.2f} GiB")
     if a.write:
         prof = json.load(open(a.write))
+        old = prof.get("constants") or {}
+        if capped and old.get("overhead", 0) > c["overhead"] and old.get("from", {}).get("tp") == a.tp:
+            # a lower bound never replaces what an uncapped launch measured
+            c["overhead"] = old["overhead"]
+            print(f"overhead kept at {old['overhead'] / GiB:.2f} GiB from {old['from'].get('log')}")
         prof["constants"] = c
         with open(a.write, "w") as f:
             json.dump(prof, f, indent=2, ensure_ascii=False)

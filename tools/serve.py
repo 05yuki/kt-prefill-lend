@@ -2,7 +2,7 @@
 """Serve a model with its patched tree: probe the host, size the launch, set the profile's knobs, start SGLang.
 
 usage: serve.py --profile NAME --venv VENV --tree SGLANG_TREE --config-dir DIR [--experts DIR | --gguf DIR]
-                [--draft-dir DIR] [--tp 1|2] [--context T] [--port 8080] [--hot N] [--mem-fraction F] [--chunk C]
+                [--draft-dir DIR] [--tp 1|2] [--context T] [--port 8080] [--hot N] [--chunk C]
                 [--kv-dtype bf16|fp8] [--mamba-slots N] [--threads N] [--placement FILE] [--hot-seed JSON]
                 [--draft-hot FILE] [--log-dir DIR] [--cache-dir DIR] [--env KEY=VALUE ...] [--background] [--dry-run]
                 [--plan [--plan-cap 36864]]
@@ -12,7 +12,12 @@ usage: serve.py --profile NAME --venv VENV --tree SGLANG_TREE --config-dir DIR [
   --config-dir   the model directory SGLang loads (config + tokenizer; for a GGUF serve, tools/make-config-dir.py)
   --gguf / --experts   where the experts are (a GGUF dir, or a second checkpoint dir); default: the config dir
   --draft-dir    the MTP draft directory when the profile serves one (tools/make-draft-dir.py)
-  --hot / --mem-fraction / --chunk / --threads   override the plan (tools/plan-launch.py prints the arithmetic)
+  --context      default: the model's context (the profile's max_context, else max_position_embeddings); the KV
+                 pool is the context. When the card cannot hold it beside the profile's min_hot experts a layer,
+                 the largest context that can, said so before the launch
+  --hot / --chunk / --threads   override the plan (tools/plan-launch.py prints the arithmetic). There is no memory
+                 fraction to set: --mem-fraction-static follows from the card, the graphs and the profile's
+                 free_min_gb (the free memory decode keeps)
   --plan         the prefill chunk planned per request over the KV pool's free pages (kv-vmm/; README, "The chunk
                  per request"): the launch chunk becomes --plan-cap, the lend's own chunk the fallback; a setup's
                  first launch runs the lend at its chunk and measures, the next ones plan
@@ -39,19 +44,22 @@ def sh(cmd, **kw):
     return r.stdout
 
 
-def wait_for_pool(log_path, proc, timeout=1800):
-    """The pool the server sized (max_total_num_tokens=N in its log), or None if it died / timed out."""
+
+
+def wait_for_free(log_path, proc, timeout=3600):
+    """The smallest available_gpu_mem the ranks report once their graphs are captured (bytes), or None."""
     import re
     t0 = time.time()
     while time.time() - t0 < timeout:
         if os.path.exists(log_path):
             with open(log_path, "rb") as f:
-                m = re.search(rb"max_total_num_tokens=(\d+)", f.read())
-            if m:
-                return int(m.group(1))
+                s = f.read()
+            if b"The server is fired up" in s:
+                got = [float(x) for x in re.findall(rb"available_gpu_mem=([0-9.]+) GB", s)]
+                return min(got) * 2**30 if got else None  # sglang prints GiB
         if proc.poll() is not None:
             return None
-        time.sleep(3)
+        time.sleep(5)
     return None
 
 
@@ -84,7 +92,6 @@ def main():
     ap.add_argument("--context", type=int)
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--hot", type=int)
-    ap.add_argument("--mem-fraction", type=float)
     ap.add_argument("--chunk", type=int)
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8"])
     ap.add_argument("--mamba-slots", type=int)
@@ -98,11 +105,14 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE, overrides any default")
     ap.add_argument("--background", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--plan", action="store_true", help="plan the prefill chunk per request (kv-vmm/)")
+    ap.add_argument("--plan", action="store_true", help="plan the prefill chunk per request (kv-vmm/); the default "
+                    "when the tree has libkv_vmm.so (tools/install.sh builds it)")
+    ap.add_argument("--no-plan", action="store_true", help="the lend's own chunk, no KV loan")
     ap.add_argument("--plan-cap", type=int, default=36864, help="the largest planned chunk (--plan)")
     ap.add_argument("--calibrate", action="store_true",
-                    help="launch, read the pool the server sized (max_total_num_tokens); if it is short of the context, "
-                         "turn the shortfall into hot experts, remember the correction for this profile and key, and relaunch")
+                    help="launch, read the pool the server sized (max_total_num_tokens) and the memory left free after "
+                         "its graphs; a pool short of the context costs hot experts, free memory past the profile's "
+                         "free_min_gb buys more; remember the correction for this profile and key, and relaunch")
     a = ap.parse_args()
 
     pf = a.profile if a.profile.endswith(".json") else os.path.join(PROFILES, a.profile + ".json")
@@ -139,17 +149,17 @@ def main():
     if len(gpus) < tp:
         raise SystemExit(f"{len(gpus)} GPUs, tp {tp}")
     d = prof["defaults"][str(tp)]
-    context = a.context or d["context"]
-    # the model's --context-length when the profile keeps it apart from the pool (DeepSeek V4: 1M over a 262K pool)
-    context_length = max(context, d.get("context_length") or 0) if not a.context else context
-    mem_fraction = a.mem_fraction or d["mem_fraction"]
     kv_dtype = a.kv_dtype or d["kv_dtype"]
     mamba_slots = a.mamba_slots or d["mamba_slots"]
     pools = d["pools"]
     ranks = gpus[:tp]
-    plan_cmd = [sys.executable, os.path.join(HERE, "plan-launch.py"), a.config_dir, "--tp", str(tp), "--context", str(context),
-                "--mem-fraction", str(mem_fraction), "--kv-dtype", kv_dtype, "--mamba-slots", str(mamba_slots),
-                "--embed-host", str(w.get("embed_host", 0)), "--json"]
+    plan_cmd = [sys.executable, os.path.join(HERE, "plan-launch.py"), a.config_dir, "--tp", str(tp),
+                "--kv-dtype", kv_dtype, "--mamba-slots", str(mamba_slots), "--embed-host", str(w.get("embed_host", 0)),
+                "--min-hot", str(prof.get("min_hot", 0)), "--free-min-gb", str(d.get("free_min_gb", 1.0)), "--json"]
+    if a.context:
+        plan_cmd += ["--context", str(a.context)]
+    if prof.get("max_context"):
+        plan_cmd += ["--max-context", str(prof["max_context"])]
     if a.gguf:
         plan_cmd += ["--gguf", a.gguf]
     elif a.experts and w.get("experts_from"):
@@ -158,24 +168,28 @@ def main():
         plan_cmd += ["--draft-bytes", "0"]
     elif w.get("draft_bytes_assumed"):
         plan_cmd += ["--draft-bytes", str(int(w["draft_bytes_assumed"] * 2**30 / tp))]  # the draft dir's share per rank
-    if prof.get("constants"):
-        plan_cmd += ["--constants", pf]  # calibrated from a launch log (tools/plan-calibrate.py)
+    # constants measured on this host by --calibrate first, else the profile's when they are for this TP
+    cal_path = os.path.join(a.cache_dir, "constants", f"{prof['name']}-tp{tp}-{os.path.basename(experts_dir.rstrip('/'))}.json")
+    cal_tp = str((prof.get("constants") or {}).get("from", {}).get("tp") or (list(prof["defaults"])[0] if len(prof["defaults"]) == 1 else ""))
+    if os.path.exists(cal_path):
+        plan_cmd += ["--constants", cal_path]
+    elif prof.get("constants") and cal_tp == str(tp):
+        plan_cmd += ["--constants", pf]  # calibrated from a launch log of this TP (tools/plan-calibrate.py)
     plan = json.loads(sh(plan_cmd))
+    context = context_length = plan["context"]
+    mem_fraction = plan["mem_fraction"]
     kv_lend = prof.get("env_by_tp", {}).get(str(tp), {}).get("KT_HOT_KV_LEND") == "1"
     key = f"tp{tp}-ctx{context}-mamba{mamba_slots}-{os.path.basename(experts_dir.rstrip('/'))}"
-    corr_path = os.path.join(a.cache_dir, "plan-corrections", f"{prof['name']}-{key}.json")
-    corr = json.load(open(corr_path)) if os.path.exists(corr_path) else {}
     if a.hot is not None:
         hot = a.hot
-    elif "hot" in d:
-        hot = d["hot"]  # the profile's measured value; the plan is printed beside it
     else:
         hot = plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"]
-        hot = max(0, hot + corr.get("hot_delta", 0))  # learned from an earlier launch's pool (see --calibrate)
+        hot = max(hot, prof.get("min_hot", 0))
     chunk = a.chunk or d.get("chunk") or plan["chunk"]
     threads = a.threads or d.get("threads") or plan["threads"]
     plan_env, plan_note = {}, None
-    if a.plan:
+    lib_in_tree = os.path.exists(os.path.join(a.tree, "python", "sglang", "srt", "layers", "moe", "libkv_vmm.so"))
+    if not a.no_plan and (a.plan or lib_in_tree):
         # the planned setup's measurements are its own (the loans change what a window has)
         key += "-plan"
         lib = os.path.join(a.tree, "python", "sglang", "srt", "layers", "moe", "libkv_vmm.so")
@@ -259,7 +273,9 @@ def main():
     with open(os.path.join(run, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
     print(f"{prof['name']} tp {tp}: hot {hot} per layer (plan {plan['hot_experts_per_layer']}, lent ~{plan['lent_from_empty_pool']}), "
-          f"chunk {chunk}, threads {threads} on nodes {[g['numa_node'] for g in ranks]}, context {context}, mem {mem_fraction}, KV {kv_dtype}")
+          f"chunk {chunk}, threads {threads} on nodes {[g['numa_node'] for g in ranks]}, context {context}"
+          + (f" of the model's {plan['model_context']}" if context != plan["model_context"] else "")
+          + f" (pool = context), KV {kv_dtype}, static {mem_fraction} of the card")
     for n in plan["notes"] + ([plan_note] if plan_note else []):
         print("! " + n)
     print("log directory:", run)
@@ -271,25 +287,57 @@ def main():
     with open(os.path.join(run, "server.pid"), "w") as f:
         f.write(str(proc.pid))
     if a.calibrate:
-        pool = wait_for_pool(os.path.join(run, "server.log"), proc)
-        if pool is None:
-            print("calibrate: the server did not report a pool (see the log)")
+        # this launch's own accounting (weights, KV bytes a token, states, what the server held besides them, the
+        # graphs) as the constants of this profile, TP and experts on this host; plan again from them, and launch
+        # again when the context or the hot count moves
+        log_path = os.path.join(run, "server.log")
+        free = wait_for_free(log_path, proc)
+        if free is None:
+            print("calibrate: the server did not come up (see the log)")
             return 1
-        kv_tok = plan["terms"]["kv_pool"] / max(1, context)
-        slot = plan["expert_slot_per_rank"] * (plan.get("moe_layers") or model_layers(a.config_dir))
-        short = context - pool
-        delta = -int(-(-short * kv_tok // slot)) if short > 0 else 0  # slots a layer the shortfall is worth, rounded up
-        print(f"calibrate: pool {pool} against context {context}: {'short by ' + str(short) + ' tokens' if short > 0 else 'enough'}"
-              f" -> hot delta {delta} (this launch used hot {hot})")
-        os.makedirs(os.path.dirname(corr_path), exist_ok=True)
-        with open(corr_path, "w") as f:
-            json.dump({"hot_delta": corr.get("hot_delta", 0) + delta, "pool": pool, "hot": hot, "context": context}, f)
-        if delta:
+        os.makedirs(os.path.dirname(cal_path), exist_ok=True)
+        if not os.path.exists(cal_path):
+            with open(cal_path, "w") as f:
+                json.dump({"name": prof["name"]}, f)
+        sh([sys.executable, os.path.join(HERE, "plan-calibrate.py"), log_path, "--hot", str(hot),
+            "--slot-bytes", str(plan["expert_slot_per_rank"]), "--moe-layers", str(plan.get("moe_layers") or model_layers(a.config_dir)),
+            "--vram-total", str(plan["vram_per_rank"]), "--mem-fraction", str(mem_fraction), "--kv-dtype", kv_dtype,
+            "--context", str(context), "--tp", str(tp), "--write", cal_path])
+        again = json.loads(sh([x for x in plan_cmd if x != "--constants" and x not in (pf, cal_path)] + ["--constants", cal_path]))
+        hot2 = a.hot if a.hot is not None else max(prof.get("min_hot", 0),
+                                                   again["hot_fixed_with_kv_lend"] if kv_lend else again["hot_experts_per_layer"])
+        print(f"calibrate: {free / 2**30:.2f} GiB free after the graphs; measured constants in {cal_path}: "
+              f"context {context} -> {again['context']}, hot {hot} -> {hot2}")
+        rounds = int(os.environ.get("KT_SERVE_CALIBRATE_ROUND", "1"))
+        with open(log_path, "rb") as f:
+            import re
+            got = re.search(rb"max_total_num_tokens=(\d+)", f.read())
+        pool = int(got.group(1)) if got else 0
+        # launch again only for what matters: another context, a pool short of it, decode left with too little
+        # free memory, or hot experts worth a launch (a slot or two either way is the measurement's own spread,
+        # and on Flash-Next NVFP4 every hot count is another set of GPU experts)
+        free_min = d.get("free_min_gb", 1.0) * 2**30
+        why = ("the context moves" if again["context"] != context else
+               f"the pool is {pool}, short of the context" if pool < context else
+               f"{free / 2**30:.2f} GiB free is short of {free_min / 2**30:.2f}" if free < free_min - 0.25 * 2**30 and hot2 < hot else
+               f"{hot2 - hot} more hot experts a layer" if hot2 - hot >= max(2, hot // 20) else "")
+        if why and rounds >= 3:
+            print(f"calibrate: {why} after 3 launches; keeping this one")
+        elif why:
+            print(f"calibrate: {why}")
             proc.terminate()
-            proc.wait(timeout=120)
-            print(f"calibrate: relaunching with hot {hot + delta} (correction saved to {corr_path})")
-            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + [x for x in sys.argv[1:] if x != "--calibrate"])
-        print("calibrate: the plan holds; correction saved")
+            proc.wait(timeout=180)
+            # the scheduler processes let go of the cards a little after the server exits
+            for _ in range(60):
+                if not json.loads(sh([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json"]))["gpu_in_use"]:
+                    break
+                time.sleep(5)
+            print("calibrate: relaunching on the measured constants", flush=True)
+            # calibrate again from the next launch (a capped pool's constants are a lower bound)
+            os.environ["KT_SERVE_CALIBRATE_ROUND"] = str(rounds + 1)
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        else:
+            print("calibrate: the plan holds")
     if a.background:
         print(f"started pid {proc.pid}")
         print(f"tail the log for 'max_total_num_tokens=': the pool the server sized against context {context}")

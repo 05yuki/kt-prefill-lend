@@ -11,11 +11,10 @@
   },
   "defaults": {
     "2": {
-      "context": 131072,
-      "mem_fraction": 0.88,
       "kv_dtype": "fp8",
       "mamba_slots": 1,
-      "pools": 2
+      "pools": 2,
+      "free_min_gb": 1.0
     }
   },
   "command": [
@@ -37,6 +36,8 @@
     "--kv-cache-dtype",
     "{kv_cache_dtype}",
     "--context-length",
+    "{context}",
+    "--max-total-tokens",
     "{context}",
     "--mem-fraction-static",
     "{mem_fraction}",
@@ -113,5 +114,6 @@
       "pool_tokens": 213056,
       "avail_after_pool_gb": 1.79
     }
-  }
+  },
+  "min_hot": 0
 }

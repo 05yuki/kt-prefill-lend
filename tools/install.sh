@@ -120,5 +120,15 @@ shopt -u nullglob
 dst="$site/kt_kernel/$(basename "$so")"
 cp "$so" "$dst.new" && mv -f "$dst.new" "$dst"
 "$py" -c "import kt_kernel.kt_kernel_ext as e; print('kt_kernel_ext', e.__file__)"
+
+# --- the prefill plan: the KV pool on remappable memory (kv-vmm) and the streamer's row blocks, so a prefill
+# borrows the pool's free pages (serve.py turns the plan on when the tree has libkv_vmm.so)
+CUDA_HOME="$CUDA_HOME" bash "$repo/kv-vmm/build.sh"
+if ! grep -q kt_kv_vmm "$work/sglang/python/sglang/srt/utils/torch_memory_saver_adapter.py"; then
+  "$py" "$repo/kv-vmm/sglang-kt-kv-vmm.py" "$work/sglang"
+fi
+if ! grep -q KT_GPU_STREAM_ROW_BLOCK "$work/sglang/python/sglang/srt/layers/moe/kt_stream_prefill.py"; then
+  "$py" "$repo/patches/sglang-kt-stream-row-block.py" "$work/sglang"
+fi
 echo "done: venv $venv, sglang $work/sglang, ktransformers $work/ktransformers"
 echo "next: tools/make-config-dir.py <hf dir> <gguf dir> <config dir>; tools/make-draft-dir.py; tools/serve.py --venv $venv --tree $work/sglang ..."

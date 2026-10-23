@@ -87,13 +87,18 @@ tools/install.sh ~/kt-serve                                                 # 10
 tools/make-config-dir.py <HF dir> <gguf dir> ~/kt-serve/config
 ~/kt-serve/venv/bin/python tools/make-draft-dir.py <mtp gguf> <HF dir> ~/kt-serve/draft   # optional
 tools/serve.py --profile flash-next-gguf --venv ~/kt-serve/venv --tree ~/kt-serve/sglang \
-               --config-dir ~/kt-serve/config --gguf <gguf dir> --draft-dir ~/kt-serve/draft --tp 1 --context 65536
+               --config-dir ~/kt-serve/config --gguf <gguf dir> --draft-dir ~/kt-serve/draft --tp 1 --calibrate
 ```
 
-`serve.py` probes the host and the model, sizes the KV pool and the hot
-experts, and prints the command with its arithmetic (`--dry-run` stops there,
-`--plan` turns the plan on). Profiles: `flash-next-gguf`, `flash-next-nvfp4`,
-`glm53-flash`, `dsv4-flash-vision`, `mimo-v26-flash`.
+`serve.py` probes the host and the model and prints the command with its
+arithmetic (`--dry-run` stops there). The context is the model's own and the
+KV pool is the context; the card's remainder goes to hot experts, and the
+memory fraction follows from that. `--calibrate` reads the first launch's log,
+keeps what it measured and relaunches if the plan moved (later launches start
+from those numbers). The plan is on when the tree has kv-vmm built
+(`install.sh` builds it; `--no-plan` turns it off). Profiles:
+`flash-next-gguf`, `flash-next-nvfp4`, `glm53-flash`, `dsv4-flash-vision`,
+`mimo-v26-flash`.
 
 **On a server you already run:**
 
